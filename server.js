@@ -268,7 +268,7 @@ let db;
 async function connectToMongoDB() {
   try {
     const client = await MongoClient.connect(MONGODB_URI);
-    db = client.db();
+    db = client.db("workiz-sync");
     console.log("Connected to MongoDB Atlas");
   } catch (error) {
     console.error("Error connecting to MongoDB:", error);
