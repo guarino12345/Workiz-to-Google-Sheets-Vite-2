@@ -209,6 +209,242 @@ function getStartDate() {
   return sixtyDaysAgo.toISOString().split("T")[0]; // Format as YYYY-MM-DD
 }
 
+// Job Queue System with Rate Limiting
+class JobQueue {
+  constructor() {
+    this.CHUNK_DURATION = 12 * 60 * 1000; // 12 minutes
+    this.RATE_LIMIT_DELAY = 2500; // 2.5 seconds average
+    this.JOBS_PER_CHUNK = Math.floor(
+      this.CHUNK_DURATION / this.RATE_LIMIT_DELAY
+    );
+  }
+
+  async addJobsToQueue(accountId, jobs, operation = "update") {
+    const db = await ensureDbConnection();
+    const queueJobs = jobs.map((job, index) => ({
+      accountId: new ObjectId(accountId),
+      jobUUID: job.UUID,
+      operation,
+      priority: index,
+      status: "pending",
+      retryCount: 0,
+      maxRetries: 3,
+      createdAt: new Date(),
+      scheduledFor: new Date(),
+      lastAttempt: null,
+      error: null,
+      result: null,
+    }));
+
+    if (queueJobs.length > 0) {
+      await db.collection("syncQueue").insertMany(queueJobs);
+    }
+    return queueJobs.length;
+  }
+
+  async createSyncSession(accountId, totalJobs) {
+    const db = await ensureDbConnection();
+    const session = {
+      accountId: new ObjectId(accountId),
+      sessionId: `sync_${Date.now()}_${Math.random()
+        .toString(36)
+        .substr(2, 9)}`,
+      status: "running",
+      totalJobs,
+      completedJobs: 0,
+      failedJobs: 0,
+      startTime: new Date(),
+      endTime: null,
+      progress: 0,
+      currentChunk: 0,
+      totalChunks: Math.ceil(totalJobs / this.JOBS_PER_CHUNK),
+    };
+
+    const result = await db.collection("syncSessions").insertOne(session);
+    return { ...session, _id: result.insertedId };
+  }
+
+  async getNextChunk(accountId, sessionId) {
+    const db = await ensureDbConnection();
+    const session = await db.collection("syncSessions").findOne({ sessionId });
+
+    if (!session || session.status !== "running") {
+      return null;
+    }
+
+    const skip = session.currentChunk * this.JOBS_PER_CHUNK;
+    const jobs = await db
+      .collection("syncQueue")
+      .find({
+        accountId: new ObjectId(accountId),
+        status: "pending",
+      })
+      .sort({ priority: 1 })
+      .skip(skip)
+      .limit(this.JOBS_PER_CHUNK)
+      .toArray();
+
+    return { jobs, session };
+  }
+
+  async processChunk(accountId, sessionId, jobs) {
+    const db = await ensureDbConnection();
+    const account = await db
+      .collection("accounts")
+      .findOne({ _id: new ObjectId(accountId) });
+
+    if (!account) {
+      throw new Error("Account not found");
+    }
+
+    let completed = 0;
+    let failed = 0;
+    const startTime = Date.now();
+
+    for (const queueJob of jobs) {
+      try {
+        await this.processJob(account, queueJob);
+        completed++;
+
+        // Rate limiting delay
+        await new Promise((resolve) =>
+          setTimeout(resolve, this.RATE_LIMIT_DELAY)
+        );
+
+        // Check if we're approaching time limit (10 minutes)
+        if (Date.now() - startTime > 10 * 60 * 1000) {
+          break;
+        }
+      } catch (error) {
+        failed++;
+        await this.updateQueueJob(queueJob._id, "failed", error.message);
+      }
+    }
+
+    // Update session progress
+    await this.updateSessionProgress(sessionId, completed, failed);
+
+    return { completed, failed, timeElapsed: Date.now() - startTime };
+  }
+
+  async processJob(account, queueJob) {
+    const db = await ensureDbConnection();
+
+    try {
+      // Handle cleanup operation
+      if (queueJob.operation === "cleanup") {
+        // For cleanup, we delete old jobs from our database
+        const result = await db
+          .collection("jobs")
+          .deleteOne({ UUID: queueJob.jobUUID });
+        if (result.deletedCount > 0) {
+          console.log(`🧹 Cleaned up old job: ${queueJob.jobUUID}`);
+        }
+        await this.updateQueueJob(queueJob._id, "completed");
+        return;
+      }
+
+      // Handle update operation
+      const updateUrl = `https://api.workiz.com/api/v1/${account.workizApiToken}/job/get/${queueJob.jobUUID}/`;
+      const response = await fetch(updateUrl);
+
+      if (!response.ok) {
+        throw new Error(`API error: ${response.status}`);
+      }
+
+      const data = await response.json();
+
+      if (data.flag && data.data) {
+        const updatedJob = {
+          ...data.data,
+          accountId: account._id || account.id,
+        };
+
+        const result = await db
+          .collection("jobs")
+          .updateOne(
+            { UUID: queueJob.jobUUID },
+            { $set: updatedJob },
+            { upsert: true }
+          );
+
+        if (result.upsertedCount > 0) {
+          console.log(`➕ Added new job: ${queueJob.jobUUID}`);
+        } else if (result.modifiedCount > 0) {
+          console.log(`🔄 Updated existing job: ${queueJob.jobUUID}`);
+        }
+
+        await this.updateQueueJob(queueJob._id, "completed");
+      } else {
+        // Job not found, delete from our database
+        const result = await db
+          .collection("jobs")
+          .deleteOne({ UUID: queueJob.jobUUID });
+        if (result.deletedCount > 0) {
+          console.log(
+            `🗑️ Deleted job not found in Workiz: ${queueJob.jobUUID}`
+          );
+        }
+        await this.updateQueueJob(queueJob._id, "completed");
+      }
+    } catch (error) {
+      throw error;
+    }
+  }
+
+  async updateQueueJob(jobId, status, error = null) {
+    const db = await ensureDbConnection();
+    await db.collection("syncQueue").updateOne(
+      { _id: jobId },
+      {
+        $set: {
+          status,
+          lastAttempt: new Date(),
+          error: error || null,
+        },
+      }
+    );
+  }
+
+  async updateSessionProgress(sessionId, completed, failed) {
+    const db = await ensureDbConnection();
+    const session = await db.collection("syncSessions").findOne({ sessionId });
+
+    const newCompleted = session.completedJobs + completed;
+    const newFailed = session.failedJobs + failed;
+    const progress = Math.round(
+      ((newCompleted + newFailed) / session.totalJobs) * 100
+    );
+
+    await db.collection("syncSessions").updateOne(
+      { sessionId },
+      {
+        $set: {
+          completedJobs: newCompleted,
+          failedJobs: newFailed,
+          progress,
+          currentChunk: session.currentChunk + 1,
+        },
+      }
+    );
+  }
+
+  async completeSession(sessionId) {
+    const db = await ensureDbConnection();
+    await db.collection("syncSessions").updateOne(
+      { sessionId },
+      {
+        $set: {
+          status: "completed",
+          endTime: new Date(),
+        },
+      }
+    );
+  }
+}
+
+const jobQueue = new JobQueue();
+
 // Global error handler
 process.on("unhandledRejection", (reason, promise) => {
   console.error("Unhandled Rejection at:", promise, "reason:", reason);
@@ -446,393 +682,271 @@ app.get("/api/jobs", async (req, res) => {
   }
 });
 
-// Sync jobs from Workiz and save to MongoDB
-app.post("/api/sync-jobs/:accountId", async (req, res) => {
-  const accountStartTime = Date.now();
+// Queue management endpoints
+app.post("/api/queue/add", async (req, res) => {
+  try {
+    const { accountId, jobs, operation } = req.body;
+    const queueCount = await jobQueue.addJobsToQueue(
+      accountId,
+      jobs,
+      operation
+    );
+    res.json({ success: true, queueCount });
+  } catch (error) {
+    console.error("Error adding jobs to queue:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
 
+app.get("/api/queue/status", async (req, res) => {
+  try {
+    const db = await ensureDbConnection();
+    const pendingCount = await db
+      .collection("syncQueue")
+      .countDocuments({ status: "pending" });
+    const completedCount = await db
+      .collection("syncQueue")
+      .countDocuments({ status: "completed" });
+    const failedCount = await db
+      .collection("syncQueue")
+      .countDocuments({ status: "failed" });
+
+    res.json({ pendingCount, completedCount, failedCount });
+  } catch (error) {
+    console.error("Error getting queue status:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post("/api/queue/process", async (req, res) => {
+  try {
+    const { accountId, sessionId } = req.body;
+    const chunk = await jobQueue.getNextChunk(accountId, sessionId);
+
+    if (!chunk || chunk.jobs.length === 0) {
+      return res.json({ completed: true, message: "No more jobs to process" });
+    }
+
+    const result = await jobQueue.processChunk(
+      accountId,
+      sessionId,
+      chunk.jobs
+    );
+    res.json(result);
+  } catch (error) {
+    console.error("Error processing queue chunk:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get("/api/sync/status/:sessionId", async (req, res) => {
+  try {
+    const db = await ensureDbConnection();
+    const session = await db
+      .collection("syncSessions")
+      .findOne({ sessionId: req.params.sessionId });
+
+    if (!session) {
+      return res.status(404).json({ error: "Session not found" });
+    }
+
+    res.json(session);
+  } catch (error) {
+    console.error("Error getting sync status:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Automated chunk processing endpoint (called by Vercel cron)
+app.get("/api/queue/process-all", async (req, res) => {
+  try {
+    const db = await ensureDbConnection();
+    console.log("Starting automated chunk processing");
+
+    // Get all running sessions
+    const runningSessions = await db
+      .collection("syncSessions")
+      .find({ status: "running" })
+      .toArray();
+
+    console.log(`Found ${runningSessions.length} running sessions`);
+
+    let processedSessions = 0;
+    let completedSessions = 0;
+
+    for (const session of runningSessions) {
+      try {
+        // Get next chunk for this session
+        const chunk = await jobQueue.getNextChunk(
+          session.accountId,
+          session.sessionId
+        );
+
+        if (!chunk || chunk.jobs.length === 0) {
+          // No more jobs to process, mark session as complete
+          await jobQueue.completeSession(session.sessionId);
+          completedSessions++;
+          console.log(`Completed session: ${session.sessionId}`);
+          continue;
+        }
+
+        // Process the chunk
+        const result = await jobQueue.processChunk(
+          session.accountId,
+          session.sessionId,
+          chunk.jobs
+        );
+        processedSessions++;
+
+        console.log(
+          `Processed chunk for session ${session.sessionId}: ${result.completed} completed, ${result.failed} failed`
+        );
+
+        // Check if session is complete after this chunk
+        const updatedSession = await db
+          .collection("syncSessions")
+          .findOne({ sessionId: session.sessionId });
+        if (updatedSession.progress >= 100) {
+          await jobQueue.completeSession(session.sessionId);
+          completedSessions++;
+          console.log(`Completed session: ${session.sessionId}`);
+        }
+      } catch (error) {
+        console.error(
+          `Error processing session ${session.sessionId}:`,
+          error.message
+        );
+        // Continue with next session instead of failing completely
+      }
+    }
+
+    console.log(
+      `Chunk processing complete: ${processedSessions} chunks processed, ${completedSessions} sessions completed`
+    );
+
+    res.json({
+      success: true,
+      processedSessions,
+      completedSessions,
+      totalSessions: runningSessions.length,
+      timestamp: new Date().toISOString(),
+    });
+  } catch (error) {
+    console.error("Error in automated chunk processing:", error);
+    res.status(500).json({
+      error: "Chunk processing failed",
+      message: error.message,
+      timestamp: new Date().toISOString(),
+    });
+  }
+});
+
+// Sync jobs from Workiz and save to MongoDB (Queue-based)
+app.post("/api/sync-jobs/:accountId", async (req, res) => {
   try {
     const db = await ensureDbConnection();
     const { accountId } = req.params;
-    console.log(`🔍 Starting sync for account ID: ${accountId}`);
+    console.log(`Starting sync for account: ${accountId}`);
 
-    // Find account by ID - try both id and _id fields
+    // Find account
     const account = await db.collection("accounts").findOne({
       $or: [{ _id: new ObjectId(accountId) }, { id: accountId }],
     });
 
     if (!account) {
-      console.log(`❌ Account not found for ID: ${accountId}`);
       return res.status(404).json({ error: "Account not found" });
     }
 
-    console.log(
-      `✅ Found account: ${account.name} (API Token: ${
-        account.workizApiToken ? "Present" : "Missing"
-      })`
-    );
-
     if (!account.workizApiToken) {
-      return res
-        .status(400)
-        .json({ error: "Missing API token for this account" });
+      return res.status(400).json({ error: "Missing API token" });
     }
 
-    // Fetch jobs from Workiz API using the token from the account
+    // Fetch jobs from Workiz API
     const startDate = getStartDate();
     const workizUrl = `https://api.workiz.com/api/v1/${account.workizApiToken}/job/all/?start_date=${startDate}&offset=0&records=100&only_open=false`;
-    console.log(`🌐 Fetching from Workiz: ${workizUrl}`);
 
-    const response = await RetryHandler.withRetry(
-      async () => {
-        const resp = await APIManager.fetchWithTimeout(workizUrl, {}, 45000);
-
-        if (!resp.ok) {
-          const errorText = await resp.text();
-          console.log(`❌ Workiz API error: ${resp.status} - ${errorText}`);
-
-          // Check if response is HTML (520 error page)
-          if (
-            errorText.includes('<div class="text-container">') ||
-            errorText.includes("Oops!") ||
-            errorText.includes("Something went wrong")
-          ) {
-            console.log(
-              `🚨 Detected HTML error page from Workiz API (likely 520 error)`
-            );
-            throw new Error(
-              `Workiz API 520 error - server is experiencing issues`
-            );
-          }
-
-          throw new Error(`Workiz API error: ${resp.status} - ${errorText}`);
-        }
-
-        return resp;
-      },
-      5,
-      2000,
-      workizCircuitBreaker
-    ); // 5 retries, 2s base delay, with circuit breaker
+    const response = await fetch(workizUrl);
+    if (!response.ok) {
+      throw new Error(`Workiz API error: ${response.status}`);
+    }
 
     const data = await response.json();
-    console.log(
-      `📊 Workiz API response: flag=${data.flag}, data.length=${
-        data.data?.length || 0
-      }`
-    );
-
     if (!data.flag || !Array.isArray(data.data)) {
-      console.log(`❌ Invalid Workiz API response structure`);
-      return res
-        .status(500)
-        .json({ error: "Invalid response from Workiz API" });
+      throw new Error("Invalid response from Workiz API");
     }
 
-    console.log(`📋 Processing ${data.data.length} jobs from Workiz`);
+    console.log(`Found ${data.data.length} jobs from Workiz`);
 
-    // Add accountId to each job
-    const jobs = data.data.map((job) => ({
-      ...job,
-      accountId: account._id || account.id,
-    }));
-
-    console.log(
-      `🏷️ Added accountId to jobs. Sample job UUIDs: ${jobs
-        .slice(0, 3)
-        .map((j) => j.UUID)
-        .join(", ")}`
+    // Add recent jobs to queue
+    const recentJobsCount = await jobQueue.addJobsToQueue(
+      accountId,
+      data.data,
+      "update"
     );
 
-    // Check for existing jobs with same UUIDs
-    const existingJobCount = await db.collection("jobs").countDocuments({
-      UUID: { $in: jobs.map((job) => job.UUID) },
-    });
-    console.log(
-      `🔍 Found ${existingJobCount} existing jobs with matching UUIDs`
-    );
-
-    // Upsert jobs into MongoDB
-    const bulkOps = jobs.map((job) => ({
-      updateOne: {
-        filter: { UUID: job.UUID },
-        update: { $set: job },
-        upsert: true,
-      },
-    }));
-
-    console.log(`💾 Executing bulk write with ${bulkOps.length} operations`);
-
-    if (bulkOps.length > 0) {
-      const bulkResult = await db.collection("jobs").bulkWrite(bulkOps);
-      console.log(`✅ Bulk write completed:`, {
-        matchedCount: bulkResult.matchedCount,
-        modifiedCount: bulkResult.modifiedCount,
-        upsertedCount: bulkResult.upsertedCount,
-        insertedCount: bulkResult.insertedCount,
-      });
-    }
-
-    // Verify final count
-    const finalJobCount = await db.collection("jobs").countDocuments({
-      accountId: account._id || account.id,
-    });
-    console.log(`📈 Final job count for account: ${finalJobCount}`);
-
-    // Update existing jobs and clean up old ones
-    console.log(`🔄 Starting job update and cleanup process...`);
-
-    // Get all existing jobs for this account
+    // Get all existing jobs from database for this account
     const existingJobs = await db
       .collection("jobs")
       .find({ accountId: account._id || account.id })
       .toArray();
 
-    console.log(`📋 Found ${existingJobs.length} existing jobs in database`);
+    console.log(`Found ${existingJobs.length} existing jobs in database`);
 
-    // Calculate 1-year cutoff date
+    // Add existing jobs to queue for updates
+    const existingJobsCount = await jobQueue.addJobsToQueue(
+      accountId,
+      existingJobs,
+      "update"
+    );
+
+    // Calculate 1-year cutoff date for cleanup
     const oneYearAgo = new Date();
     oneYearAgo.setDate(oneYearAgo.getDate() - 365);
 
-    let updatedJobsCount = 0;
-    let deletedJobsCount = 0;
-    let failedUpdatesCount = 0;
-
-    // Process jobs in batches to avoid memory issues and rate limiting
-    const BATCH_SIZE = 29;
-    const DELAY_BETWEEN_BATCHES = 60000; // 60 seconds in milliseconds
-
-    for (let i = 0; i < existingJobs.length; i += BATCH_SIZE) {
-      const batch = existingJobs.slice(i, i + BATCH_SIZE);
-      const batchNumber = Math.floor(i / BATCH_SIZE) + 1;
-      const totalBatches = Math.ceil(existingJobs.length / BATCH_SIZE);
-
-      console.log(
-        `📦 Processing batch ${batchNumber}/${totalBatches} (${batch.length} jobs)`
-      );
-
-      // Process each job in the current batch
-      for (const existingJob of batch) {
-        try {
-          const jobDate = new Date(existingJob.JobDateTime);
-
-          // Check if job is older than 1 year
-          if (jobDate < oneYearAgo) {
-            console.log(
-              `🗑️ Deleting old job: ${existingJob.UUID} (${existingJob.JobDateTime})`
-            );
-            await RetryHandler.withRetry(async () => {
-              await db.collection("jobs").deleteOne({ UUID: existingJob.UUID });
-            });
-            deletedJobsCount++;
-            continue;
-          }
-
-          // Update job using Workiz API
-          console.log(`🔄 Updating job: ${existingJob.UUID}`);
-          const updateUrl = `https://api.workiz.com/api/v1/${account.workizApiToken}/job/get/${existingJob.UUID}/`;
-
-          const updateResponse = await RetryHandler.withRetry(
-            async () => {
-              const resp = await APIManager.fetchWithTimeout(
-                updateUrl,
-                {},
-                30000
-              );
-
-              if (!resp.ok) {
-                const errorText = await resp.text();
-                console.log(
-                  `❌ Job update error: ${resp.status} - ${errorText}`
-                );
-
-                // Check if response is HTML (520 error page)
-                if (
-                  errorText.includes('<div class="text-container">') ||
-                  errorText.includes("Oops!") ||
-                  errorText.includes("Something went wrong")
-                ) {
-                  console.log(
-                    `🚨 Detected HTML error page from Workiz API (likely 520 error)`
-                  );
-                  throw new Error(
-                    `Workiz API 520 error - server is experiencing issues`
-                  );
-                }
-
-                throw new Error(
-                  `Job update error: ${resp.status} - ${errorText}`
-                );
-              }
-
-              return resp;
-            },
-            3,
-            1000,
-            workizCircuitBreaker
-          ); // 3 retries, 1s base delay, with circuit breaker
-
-          if (updateResponse.ok) {
-            const updateData = await updateResponse.json();
-
-            if (updateData.flag && updateData.data) {
-              // Update the job with fresh data from Workiz
-              const updatedJob = {
-                ...updateData.data,
-                accountId: account._id || account.id,
-              };
-
-              await RetryHandler.withRetry(async () => {
-                await db
-                  .collection("jobs")
-                  .updateOne({ UUID: existingJob.UUID }, { $set: updatedJob });
-              });
-
-              updatedJobsCount++;
-              console.log(`✅ Updated job: ${existingJob.UUID}`);
-            } else {
-              console.log(
-                `⚠️ Job not found in Workiz API: ${existingJob.UUID}`
-              );
-              // Job might have been deleted in Workiz, so delete from our database
-              await RetryHandler.withRetry(async () => {
-                await db
-                  .collection("jobs")
-                  .deleteOne({ UUID: existingJob.UUID });
-              });
-              deletedJobsCount++;
-            }
-          } else {
-            console.log(
-              `❌ Failed to update job ${existingJob.UUID}: ${updateResponse.status}`
-            );
-            failedUpdatesCount++;
-          }
-
-          // Add a small delay between individual job updates (100ms)
-          await new Promise((resolve) => setTimeout(resolve, 100));
-        } catch (error) {
-          console.log(
-            `❌ Error processing job ${existingJob.UUID}: ${error.message}`
-          );
-          failedUpdatesCount++;
-        }
-      }
-
-      // Add delay between batches (except for the last batch)
-      if (i + BATCH_SIZE < existingJobs.length) {
-        console.log(`⏳ Waiting 60 seconds before next batch...`);
-        await new Promise((resolve) =>
-          setTimeout(resolve, DELAY_BETWEEN_BATCHES)
-        );
-      }
-    }
-
-    console.log(`📊 Job update and cleanup completed:`);
-    console.log(`   - Updated: ${updatedJobsCount} jobs`);
-    console.log(`   - Deleted (old): ${deletedJobsCount} jobs`);
-    console.log(`   - Failed updates: ${failedUpdatesCount} jobs`);
-
-    // Record sync history
-    const syncHistoryRecord = {
-      accountId: account._id || account.id,
-      syncType: "jobs",
-      status: "success",
-      timestamp: new Date(),
-      duration: Date.now() - accountStartTime,
-      details: {
-        jobsFromWorkiz: jobs.length,
-        existingJobsFound: existingJobs.length,
-        finalJobCount: finalJobCount,
-        jobsUpdated: updatedJobsCount,
-        jobsDeleted: deletedJobsCount,
-        failedUpdates: failedUpdatesCount,
-        syncMethod: "manual",
-        jobStatusBreakdown: {
-          submitted: jobs.filter((j) => j.Status === "Submitted").length,
-          pending: jobs.filter((j) => j.Status === "Pending").length,
-          completed: jobs.filter(
-            (j) =>
-              j.Status === "Completed" || j.Status === "done pending approval"
-          ).length,
-          cancelled: jobs.filter((j) =>
-            ["Cancelled", "Canceled", "cancelled", "CANCELLED"].includes(
-              j.Status
-            )
-          ).length,
-        },
-      },
-    };
-
-    await RetryHandler.withRetry(async () => {
-      await db.collection("syncHistory").insertOne(syncHistoryRecord);
+    // Add old jobs to queue for cleanup
+    const oldJobs = existingJobs.filter((job) => {
+      const jobDate = new Date(job.JobDateTime);
+      return jobDate < oneYearAgo;
     });
 
-    // Update account's lastSyncDate
-    await RetryHandler.withRetry(async () => {
-      await db
-        .collection("accounts")
-        .updateOne(
-          { _id: account._id || new ObjectId(account.id) },
-          { $set: { lastSyncDate: new Date() } }
-        );
-    });
+    const cleanupJobsCount = await jobQueue.addJobsToQueue(
+      accountId,
+      oldJobs,
+      "cleanup"
+    );
+
+    const totalJobs = recentJobsCount + existingJobsCount + cleanupJobsCount;
+
+    // Create sync session
+    const session = await jobQueue.createSyncSession(accountId, totalJobs);
+
+    console.log(
+      `Created sync session: ${session.sessionId} with ${totalJobs} jobs (${recentJobsCount} recent, ${existingJobsCount} existing, ${cleanupJobsCount} cleanup)`
+    );
 
     res.json({
-      message: `Synced ${jobs.length} jobs for account ${
-        account.name || "Unknown"
-      }`,
+      success: true,
+      sessionId: session.sessionId,
+      totalJobs: totalJobs,
+      message: `Sync queued for ${account.name}`,
       details: {
-        jobsFromWorkiz: jobs.length,
-        existingJobsFound: existingJobs.length,
-        finalJobCount: finalJobCount,
-        jobsUpdated: updatedJobsCount,
-        jobsDeleted: deletedJobsCount,
-        failedUpdates: failedUpdatesCount,
+        jobsFromWorkiz: data.data.length,
+        existingJobsInDb: existingJobs.length,
+        oldJobsForCleanup: oldJobs.length,
+        jobsQueued: totalJobs,
+        recentJobsQueued: recentJobsCount,
+        existingJobsQueued: existingJobsCount,
+        cleanupJobsQueued: cleanupJobsCount,
+        totalChunks: session.totalChunks,
+        estimatedDuration: `${Math.ceil(session.totalChunks * 12)} minutes`,
       },
     });
   } catch (error) {
-    console.log(`❌ Sync error: ${error.message}`);
-
-    // Check if it's a circuit breaker error
-    if (error.message.includes("Circuit breaker is OPEN")) {
-      const workizState = workizCircuitBreaker.getState();
-      console.log(
-        `🚨 Circuit breaker blocked sync: ${workizState.state} state, ${workizState.failureCount} failures`
-      );
-
-      return res.status(503).json({
-        error: "Service temporarily unavailable due to API issues",
-        details: {
-          circuitBreakerState: workizState.state,
-          failureCount: workizState.failureCount,
-          timeUntilRecovery: workizState.timeUntilRecovery,
-          message: "Workiz API is experiencing issues. Please try again later.",
-        },
-      });
-    }
-
-    // Record failed sync history if we have account info
-    if (req.params.accountId) {
-      try {
-        const syncHistoryRecord = {
-          accountId: req.params.accountId,
-          syncType: "jobs",
-          status: "error",
-          timestamp: new Date(),
-          duration: Date.now() - accountStartTime,
-          errorMessage: error.message,
-          details: {},
-        };
-        await db.collection("syncHistory").insertOne(syncHistoryRecord);
-        console.log(`📝 Failed sync history recorded for jobs sync`);
-      } catch (historyError) {
-        console.log(
-          `❌ Failed to record sync history: ${historyError.message}`
-        );
-      }
-    }
-
-    res.status(500).json({ error: error.message });
+    console.error(`Sync error: ${error.message}`);
+    res.status(500).json({
+      error: "Sync failed",
+      message: error.message,
+    });
   }
 });
 
