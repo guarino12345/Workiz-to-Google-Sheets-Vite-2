@@ -202,6 +202,13 @@ class DatabaseManager {
   }
 }
 
+// Helper function to calculate start date (60 days ago)
+function getStartDate() {
+  const sixtyDaysAgo = new Date();
+  sixtyDaysAgo.setDate(sixtyDaysAgo.getDate() - 60);
+  return sixtyDaysAgo.toISOString().split("T")[0]; // Format as YYYY-MM-DD
+}
+
 // Global error handler
 process.on("unhandledRejection", (reason, promise) => {
   console.error("Unhandled Rejection at:", promise, "reason:", reason);
@@ -471,7 +478,8 @@ app.post("/api/sync-jobs/:accountId", async (req, res) => {
     }
 
     // Fetch jobs from Workiz API using the token from the account
-    const workizUrl = `https://api.workiz.com/api/v1/${account.workizApiToken}/job/all/?start_date=2025-01-01&offset=0&records=100&only_open=false`;
+    const startDate = getStartDate();
+    const workizUrl = `https://api.workiz.com/api/v1/${account.workizApiToken}/job/all/?start_date=${startDate}&offset=0&records=100&only_open=false`;
     console.log(`🌐 Fetching from Workiz: ${workizUrl}`);
 
     const response = await RetryHandler.withRetry(
@@ -1196,7 +1204,8 @@ app.post("/api/trigger-sync/:accountId", async (req, res) => {
 
     // Sync jobs
     try {
-      const workizUrl = `https://api.workiz.com/api/v1/${account.workizApiToken}/job/all/?start_date=2025-01-01&offset=0&records=100&only_open=false`;
+      const startDate = getStartDate();
+      const workizUrl = `https://api.workiz.com/api/v1/${account.workizApiToken}/job/all/?start_date=${startDate}&offset=0&records=100&only_open=false`;
       const response = await fetch(workizUrl);
 
       if (!response.ok) {
@@ -1530,7 +1539,8 @@ app.get("/api/cron/sync-jobs", async (req, res) => {
 
       try {
         // Enhanced API call with timeout and retry
-        const workizUrl = `https://api.workiz.com/api/v1/${account.workizApiToken}/job/all/?start_date=2025-01-01&offset=0&records=100&only_open=false`;
+        const startDate = getStartDate();
+        const workizUrl = `https://api.workiz.com/api/v1/${account.workizApiToken}/job/all/?start_date=${startDate}&offset=0&records=100&only_open=false`;
 
         const response = await RetryHandler.withRetry(
           async () => {
