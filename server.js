@@ -213,7 +213,7 @@ function getStartDate() {
 class JobQueue {
   constructor() {
     this.CHUNK_DURATION = 12 * 60 * 1000; // 12 minutes
-    this.RATE_LIMIT_DELAY = 2500; // 2.5 seconds average
+    this.RATE_LIMIT_DELAY = 3500; // 3.5 seconds between API calls
     this.JOBS_PER_CHUNK = Math.floor(
       this.CHUNK_DURATION / this.RATE_LIMIT_DELAY
     );
