@@ -958,10 +958,19 @@ app.post("/api/sync-to-sheets/:accountId", async (req, res) => {
     const { accountId } = req.params;
     console.log(`📊 Starting Google Sheets sync for account ID: ${accountId}`);
 
-    // Find account by ID - try both id and _id fields
-    const account = await db.collection("accounts").findOne({
-      $or: [{ _id: new ObjectId(accountId) }, { id: accountId }],
-    });
+    // Find account with better error handling
+    let account;
+    try {
+      // Try to convert to ObjectId first
+      const objectId = new ObjectId(accountId);
+      account = await db.collection("accounts").findOne({ _id: objectId });
+    } catch (error) {
+      // If ObjectId conversion fails, try as string ID
+      console.log(
+        `⚠️ ObjectId conversion failed, trying as string ID: ${accountId}`
+      );
+      account = await db.collection("accounts").findOne({ id: accountId });
+    }
 
     if (!account) {
       console.log(`❌ Account not found for ID: ${accountId}`);
@@ -1305,16 +1314,31 @@ app.post("/api/trigger-sync/:accountId", async (req, res) => {
     const { accountId } = req.params;
     console.log(`🔧 Manual sync trigger for account ID: ${accountId}`);
 
-    // Find account
-    const account = await db.collection("accounts").findOne({
-      $or: [{ _id: new ObjectId(accountId) }, { id: accountId }],
-    });
+    // Ensure database connection
+    const db = await ensureDbConnection();
+
+    // Find account with better error handling
+    let account;
+    try {
+      // Try to convert to ObjectId first
+      const objectId = new ObjectId(accountId);
+      account = await db.collection("accounts").findOne({ _id: objectId });
+    } catch (error) {
+      // If ObjectId conversion fails, try as string ID
+      console.log(
+        `⚠️ ObjectId conversion failed, trying as string ID: ${accountId}`
+      );
+      account = await db.collection("accounts").findOne({ id: accountId });
+    }
 
     if (!account) {
+      console.log(`❌ Account not found for ID: ${accountId}`);
       return res.status(404).json({ error: "Account not found" });
     }
 
     console.log(`⏰ Manual sync for account: ${account.name}`);
+
+    const accountStartTime = Date.now();
 
     // Sync jobs
     try {
