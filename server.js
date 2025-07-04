@@ -1686,18 +1686,23 @@ app.get("/api/cron/sync-jobs", async (req, res) => {
           const batch = batches[batchIndex];
           const batchStartTime = Date.now();
 
-          // Update batch status
+          // Update batch status - using arrayFilters to avoid nested positional operators
           await db.collection("syncSessions").updateOne(
             {
               sessionId: syncSession.sessionId,
               "accounts.accountId": account._id,
-              "accounts.batches.batchIndex": batchIndex,
             },
             {
               $set: {
-                "accounts.$.batches.$.status": "processing",
-                "accounts.$.batches.$.startTime": new Date(),
+                "accounts.$[account].batches.$[batch].status": "processing",
+                "accounts.$[account].batches.$[batch].startTime": new Date(),
               },
+            },
+            {
+              arrayFilters: [
+                { "account.accountId": account._id },
+                { "batch.batchIndex": batchIndex },
+              ],
             }
           );
 
@@ -1765,22 +1770,28 @@ app.get("/api/cron/sync-jobs", async (req, res) => {
             } jobs, ${updatedJobsCount} updated, ${failedUpdatesCount} failed`
           );
 
-          // Update batch status
+          // Update batch status - using arrayFilters to avoid nested positional operators
           await db.collection("syncSessions").updateOne(
             {
               sessionId: syncSession.sessionId,
               "accounts.accountId": account._id,
-              "accounts.batches.batchIndex": batchIndex,
             },
             {
               $set: {
-                "accounts.$.batches.$.status": "completed",
-                "accounts.$.batches.$.endTime": new Date(),
-                "accounts.$.batches.$.duration": batchDuration,
-                "accounts.$.batches.$.processedJobs": batch.length,
-                "accounts.$.batches.$.failedJobs":
+                "accounts.$[account].batches.$[batch].status": "completed",
+                "accounts.$[account].batches.$[batch].endTime": new Date(),
+                "accounts.$[account].batches.$[batch].duration": batchDuration,
+                "accounts.$[account].batches.$[batch].processedJobs":
+                  batch.length,
+                "accounts.$[account].batches.$[batch].failedJobs":
                   batch.length - updatedJobsCount,
               },
+            },
+            {
+              arrayFilters: [
+                { "account.accountId": account._id },
+                { "batch.batchIndex": batchIndex },
+              ],
             }
           );
 
@@ -2748,13 +2759,18 @@ app.post("/api/sync/parallel/account/:accountId", async (req, res) => {
           {
             sessionId,
             "accounts.accountId": accountId,
-            "accounts.batches.batchIndex": batchIndex,
           },
           {
             $set: {
-              "accounts.$.batches.$.status": "processing",
-              "accounts.$.batches.$.startTime": new Date(),
+              "accounts.$[account].batches.$[batch].status": "processing",
+              "accounts.$[account].batches.$[batch].startTime": new Date(),
             },
+          },
+          {
+            arrayFilters: [
+              { "account.accountId": accountId },
+              { "batch.batchIndex": batchIndex },
+            ],
           }
         );
       }
@@ -2830,17 +2846,23 @@ app.post("/api/sync/parallel/account/:accountId", async (req, res) => {
           {
             sessionId,
             "accounts.accountId": accountId,
-            "accounts.batches.batchIndex": batchIndex,
           },
           {
             $set: {
-              "accounts.$.batches.$.status": "completed",
-              "accounts.$.batches.$.endTime": new Date(),
-              "accounts.$.batches.$.duration": batchDuration,
-              "accounts.$.batches.$.processedJobs": batch.length,
-              "accounts.$.batches.$.failedJobs":
+              "accounts.$[account].batches.$[batch].status": "completed",
+              "accounts.$[account].batches.$[batch].endTime": new Date(),
+              "accounts.$[account].batches.$[batch].duration": batchDuration,
+              "accounts.$[account].batches.$[batch].processedJobs":
+                batch.length,
+              "accounts.$[account].batches.$[batch].failedJobs":
                 batch.length - updatedJobsCount,
             },
+          },
+          {
+            arrayFilters: [
+              { "account.accountId": accountId },
+              { "batch.batchIndex": batchIndex },
+            ],
           }
         );
       }
