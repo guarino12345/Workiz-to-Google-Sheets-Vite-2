@@ -8,25 +8,20 @@ import {
   LinearProgress,
   Chip,
   Alert,
-  Grid,
   Accordion,
   AccordionSummary,
   AccordionDetails,
-  IconButton,
-  Tooltip,
-  CircularProgress,
-  Divider
+  CircularProgress
 } from '@mui/material';
 import {
   PlayArrow,
   Stop,
   Refresh,
-  ExpandMore,
   CheckCircle,
   Error,
   Schedule,
-  TrendingUp,
-  Info
+  Info,
+  ExpandMore
 } from '@mui/icons-material';
 import { api } from '../utils/api';
 
@@ -72,31 +67,26 @@ interface SyncSessionSummary {
 }
 
 const ParallelSync: React.FC = () => {
+  const [sessions, setSessions] = useState<SyncSessionSummary[]>([]);
+  const [currentSession, setCurrentSession] = useState<SyncSession | null>(null);
   const [isInitializing, setIsInitializing] = useState(false);
   const [isProcessing, setIsProcessing] = useState(false);
-  const [currentSession, setCurrentSession] = useState<SyncSession | null>(null);
-  const [sessions, setSessions] = useState<SyncSessionSummary[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [statusInterval, setStatusInterval] = useState<NodeJS.Timeout | null>(null);
 
-  // Load existing sessions on component mount
   useEffect(() => {
     loadSessions();
-  }, []);
-
-  // Cleanup interval on unmount
-  useEffect(() => {
     return () => {
       if (statusInterval) {
         clearInterval(statusInterval);
       }
     };
-  }, [statusInterval]);
+  }, []);
 
   const loadSessions = async () => {
     try {
       const response = await api.get('/api/sync/parallel/sessions');
-      setSessions((response as any).data.sessions);
+      setSessions(response.data || []);
     } catch (error) {
       console.error('Failed to load sessions:', error);
     }
@@ -108,9 +98,9 @@ const ParallelSync: React.FC = () => {
 
     try {
       const response = await api.post('/api/sync/parallel/init');
-      const { sessionId, accounts } = (response as any).data;
+      const { sessionId, accounts } = response.data;
 
-      console.log('Sync initialized:', (response as any).data);
+      console.log('Sync initialized:', response.data);
 
       // Start processing all accounts in parallel
       await processAccounts(sessionId, accounts);
@@ -200,7 +190,7 @@ const ParallelSync: React.FC = () => {
     setCurrentSession(null);
   };
 
-  const getStatusColor = (status: string) => {
+  const getStatusColor = (status: string): 'success' | 'primary' | 'error' | 'default' => {
     switch (status) {
       case 'completed': return 'success';
       case 'processing': return 'primary';
@@ -294,7 +284,7 @@ const ParallelSync: React.FC = () => {
               </Typography>
               <Chip
                 label={currentSession.overallStatus}
-                color={getStatusColor(currentSession.overallStatus) as any}
+                color={getStatusColor(currentSession.overallStatus)}
                 icon={getStatusIcon(currentSession.overallStatus)}
               />
             </Box>
@@ -310,40 +300,40 @@ const ParallelSync: React.FC = () => {
               />
             </Box>
 
-            <Grid container spacing={2} sx={{ mb: 2 }}>
-              <Grid item xs={3}>
+            <Box sx={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 2, mb: 2 }}>
+              <Box>
                 <Typography variant="body2" color="text.secondary">
                   Total Accounts
                 </Typography>
                 <Typography variant="h6">
                   {currentSession.totalAccounts}
                 </Typography>
-              </Grid>
-              <Grid item xs={3}>
+              </Box>
+              <Box>
                 <Typography variant="body2" color="text.secondary">
                   Completed
                 </Typography>
                 <Typography variant="h6" color="success.main">
                   {currentSession.completedAccounts}
                 </Typography>
-              </Grid>
-              <Grid item xs={3}>
+              </Box>
+              <Box>
                 <Typography variant="body2" color="text.secondary">
                   Processing
                 </Typography>
                 <Typography variant="h6" color="primary.main">
                   {currentSession.processingAccounts}
                 </Typography>
-              </Grid>
-              <Grid item xs={3}>
+              </Box>
+              <Box>
                 <Typography variant="body2" color="text.secondary">
                   Failed
                 </Typography>
                 <Typography variant="h6" color="error.main">
                   {currentSession.failedAccounts}
                 </Typography>
-              </Grid>
-            </Grid>
+              </Box>
+            </Box>
 
             {/* Account Details */}
             <Accordion>
@@ -353,9 +343,9 @@ const ParallelSync: React.FC = () => {
                 </Typography>
               </AccordionSummary>
               <AccordionDetails>
-                <Grid container spacing={2}>
+                <Box sx={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(300px, 1fr))', gap: 2 }}>
                   {currentSession.accounts.map((account) => (
-                    <Grid item xs={12} md={6} key={account.accountId}>
+                    <Box key={account.accountId}>
                       <Card variant="outlined">
                         <CardContent>
                           <Box sx={{ display: 'flex', alignItems: 'center', mb: 1 }}>
@@ -364,7 +354,7 @@ const ParallelSync: React.FC = () => {
                             </Typography>
                             <Chip
                               label={account.status}
-                              color={getStatusColor(account.status) as any}
+                              color={getStatusColor(account.status)}
                               size="small"
                               icon={getStatusIcon(account.status)}
                             />
@@ -378,7 +368,7 @@ const ParallelSync: React.FC = () => {
                               <LinearProgress 
                                 variant="determinate" 
                                 value={account.progress} 
-                                size="small"
+                                sx={{ mt: 1 }}
                               />
                             </Box>
                           )}
@@ -408,9 +398,9 @@ const ParallelSync: React.FC = () => {
                           )}
                         </CardContent>
                       </Card>
-                    </Grid>
+                    </Box>
                   ))}
-                </Grid>
+                </Box>
               </AccordionDetails>
             </Accordion>
           </CardContent>
@@ -433,7 +423,7 @@ const ParallelSync: React.FC = () => {
                   </Typography>
                   <Chip
                     label={session.overallStatus}
-                    color={getStatusColor(session.overallStatus) as any}
+                    color={getStatusColor(session.overallStatus)}
                     size="small"
                   />
                 </Box>
@@ -451,7 +441,7 @@ const ParallelSync: React.FC = () => {
                     <Chip
                       key={index}
                       label={`${account.accountName}: ${account.progress}%`}
-                      color={getStatusColor(account.status) as any}
+                      color={getStatusColor(account.status)}
                       size="small"
                       sx={{ mr: 1, mb: 1 }}
                     />
