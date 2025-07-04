@@ -46,7 +46,6 @@ class CircuitBreaker {
   onSuccess() {
     this.failureCount = 0;
     this.state = "CLOSED";
-    console.log("✅ Circuit breaker reset to CLOSED state");
   }
 
   onFailure() {
@@ -1534,7 +1533,6 @@ app.get("/api/cron/sync-jobs", async (req, res) => {
     }
 
     console.log(`🕐 Vercel Cron Job triggered at: ${new Date().toISOString()}`);
-    console.log(`📊 Starting parallel sync process...`);
 
     // Ensure database connection with health check
     const db = await ensureDbConnection();
@@ -1553,7 +1551,7 @@ app.get("/api/cron/sync-jobs", async (req, res) => {
       });
     }
 
-    console.log(`📋 Found ${accounts.length} accounts for parallel processing`);
+    console.log(`📋 Found ${accounts.length} accounts for processing`);
 
     // Create sync session for tracking (same as parallel sync)
     const syncSession = {
@@ -1579,8 +1577,6 @@ app.get("/api/cron/sync-jobs", async (req, res) => {
     // Store sync session
     await db.collection("syncSessions").insertOne(syncSession);
 
-    console.log(`📋 Created cron sync session: ${syncSession.sessionId}`);
-
     // Process all accounts in parallel using the same logic as manual parallel sync
     const accountPromises = accounts.map(async (account) => {
       const accountStartTime = Date.now();
@@ -1601,7 +1597,7 @@ app.get("/api/cron/sync-jobs", async (req, res) => {
           }
         );
 
-        // Fetch jobs from Workiz (same logic as parallel sync)
+        // Step 1: Fetch recent jobs from Workiz (14 days)
         const startDate = new Date();
         startDate.setDate(startDate.getDate() - 14);
         const formattedStartDate = startDate.toISOString().split("T")[0];
@@ -1627,25 +1623,51 @@ app.get("/api/cron/sync-jobs", async (req, res) => {
           throw new Error("Invalid response from Workiz API");
         }
 
-        // Filter jobs by sourceFilter if configured
-        let filteredJobs = data.data;
+        // Filter recent jobs by sourceFilter if configured
+        let filteredRecentJobs = data.data;
         if (
           account.sourceFilter &&
           Array.isArray(account.sourceFilter) &&
           account.sourceFilter.length > 0
         ) {
-          filteredJobs = data.data.filter((job) =>
+          filteredRecentJobs = data.data.filter((job) =>
             account.sourceFilter.includes(job.JobSource)
           );
           console.log(
-            `Filtered: ${data.data.length} → ${filteredJobs.length} jobs`
+            `Recent jobs filtered: ${data.data.length} → ${filteredRecentJobs.length} jobs`
           );
-        } else {
-          console.log(`Using all ${data.data.length} jobs (no filter)`);
         }
 
+        // Step 2: Get all existing jobs from database for this account
+        const existingJobs = await db
+          .collection("jobs")
+          .find({ accountId: account._id })
+          .toArray();
+
+        // Step 3: Combine recent jobs with existing jobs (avoid duplicates)
+        const recentJobUuids = new Set(
+          filteredRecentJobs.map((job) => job.UUID)
+        );
+        const existingJobUuids = new Set(existingJobs.map((job) => job.UUID));
+
+        // Add existing jobs that aren't in recent list
+        const allJobsToUpdate = [...filteredRecentJobs];
+        existingJobs.forEach((existingJob) => {
+          if (!recentJobUuids.has(existingJob.UUID)) {
+            allJobsToUpdate.push(existingJob);
+          }
+        });
+
+        console.log(
+          `${account.name}: ${allJobsToUpdate.length} jobs to update (${
+            filteredRecentJobs.length
+          } recent + ${
+            allJobsToUpdate.length - filteredRecentJobs.length
+          } existing)`
+        );
+
         // Add accountId to each job
-        const jobs = filteredJobs.map((job) => ({
+        const jobs = allJobsToUpdate.map((job) => ({
           ...job,
           accountId: account._id,
         }));
@@ -1764,11 +1786,6 @@ app.get("/api/cron/sync-jobs", async (req, res) => {
           }
 
           const batchDuration = Date.now() - batchStartTime;
-          console.log(
-            `Batch ${batchIndex + 1}/${batches.length}: ${
-              batch.length
-            } jobs, ${updatedJobsCount} updated, ${failedUpdatesCount} failed`
-          );
 
           // Update batch status - using arrayFilters to avoid nested positional operators
           await db.collection("syncSessions").updateOne(
@@ -1832,6 +1849,15 @@ app.get("/api/cron/sync-jobs", async (req, res) => {
           }
         );
 
+        // Step 4: Clean up old jobs (older than 32 days)
+        const cutoffDate = new Date();
+        cutoffDate.setDate(cutoffDate.getDate() - 32);
+
+        const deleteResult = await db.collection("jobs").deleteMany({
+          accountId: account._id,
+          CreatedDate: { $lt: cutoffDate.toISOString() },
+        });
+
         // Record sync history
         const syncHistoryRecord = {
           accountId: account._id,
@@ -1841,12 +1867,15 @@ app.get("/api/cron/sync-jobs", async (req, res) => {
           duration: accountDuration,
           details: {
             jobsFromWorkiz: data.data.length,
-            filteredJobs: jobs.length,
+            recentJobsFiltered: filteredRecentJobs.length,
+            existingJobsInDb: existingJobs.length,
+            totalJobsToUpdate: jobs.length,
             totalBatches: batches.length,
             batchSize: batchSize,
             jobsUpdated: updatedJobsCount,
             failedUpdates: failedUpdatesCount,
-            syncMethod: "cron",
+            jobsDeleted: deleteResult.deletedCount,
+            syncMethod: "cron_comprehensive",
             sourceFilter: account.sourceFilter,
             jobStatusBreakdown: {
               submitted: jobs.filter((j) => j.Status === "Submitted").length,
@@ -1868,7 +1897,7 @@ app.get("/api/cron/sync-jobs", async (req, res) => {
         await db.collection("syncHistory").insertOne(syncHistoryRecord);
 
         console.log(
-          `Account ${account.name} done: ${jobs.length} jobs, ${updatedJobsCount} updated, ${failedUpdatesCount} failed, ${accountDuration}ms`
+          `${account.name}: ${jobs.length} jobs processed, ${updatedJobsCount} updated, ${failedUpdatesCount} failed, ${deleteResult.deletedCount} deleted (${accountDuration}ms)`
         );
 
         return {
@@ -1878,6 +1907,9 @@ app.get("/api/cron/sync-jobs", async (req, res) => {
           jobsSynced: jobs.length,
           jobsUpdated: updatedJobsCount,
           failedUpdates: failedUpdatesCount,
+          jobsDeleted: deleteResult.deletedCount,
+          recentJobs: filteredRecentJobs.length,
+          existingJobs: existingJobs.length,
         };
       } catch (error) {
         console.error(`Error processing account ${account.name}:`, error);
@@ -1941,9 +1973,9 @@ app.get("/api/cron/sync-jobs", async (req, res) => {
       }
     );
 
-    console.log(`🎯 Cron parallel sync completed in ${totalDuration}ms:`);
-    console.log(`   - Successful: ${successfulSyncs} accounts`);
-    console.log(`   - Failed: ${failedSyncs} accounts`);
+    console.log(
+      `🎯 Cron sync completed: ${successfulSyncs} successful, ${failedSyncs} failed (${totalDuration}ms)`
+    );
 
     res.json({
       message: `Cron parallel sync completed: ${successfulSyncs} successful, ${failedSyncs} failed`,
