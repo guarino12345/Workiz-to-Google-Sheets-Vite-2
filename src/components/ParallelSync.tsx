@@ -86,7 +86,7 @@ const ParallelSync: React.FC = () => {
   const loadSessions = async () => {
     try {
       const response = await api.get('/api/sync/parallel/sessions');
-      setSessions(response.data || []);
+      setSessions((response as any).data || []);
     } catch (error) {
       console.error('Failed to load sessions:', error);
     }
@@ -97,10 +97,10 @@ const ParallelSync: React.FC = () => {
     setError(null);
 
     try {
-      const response = await api.post('/api/sync/parallel/init');
-      const { sessionId, accounts } = response.data;
+      const response = await api.post('/api/sync/parallel/init', {});
+      const { sessionId, accounts } = (response as any).data;
 
-      console.log('Sync initialized:', response.data);
+      console.log('Sync initialized:', (response as any).data);
 
       // Start processing all accounts in parallel
       await processAccounts(sessionId, accounts);
@@ -141,8 +141,8 @@ const ParallelSync: React.FC = () => {
         delayMs: 2000 // 2-second delay between API calls (30 calls per minute)
       });
 
-      console.log(`Account ${accountId} processed:`, response.data);
-      return response.data;
+      console.log(`Account ${accountId} processed:`, (response as any).data);
+      return (response as any).data;
 
     } catch (error: any) {
       console.error(`Failed to process account ${accountId}:`, error);
@@ -160,7 +160,7 @@ const ParallelSync: React.FC = () => {
     const interval = setInterval(async () => {
       try {
         const response = await api.get(`/api/sync/parallel/status/${sessionId}`);
-        const session = response.data;
+        const session = (response as any).data;
 
         setCurrentSession(session);
 
