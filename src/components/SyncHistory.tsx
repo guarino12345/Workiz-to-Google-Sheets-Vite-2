@@ -121,6 +121,11 @@ const SyncHistoryComponent: React.FC<SyncHistoryProps> = ({ accountId, refreshTr
           <Typography variant="body2" color="text.secondary">
             Jobs from Workiz: {sync.details.jobsFromWorkiz || 0}
           </Typography>
+          {sync.details.filteredJobs !== undefined && (
+            <Typography variant="body2" color="text.secondary">
+              Filtered jobs: {sync.details.filteredJobs}
+            </Typography>
+          )}
           <Typography variant="body2" color="text.secondary">
             Existing jobs found: {sync.details.existingJobsFound || 0}
           </Typography>
@@ -139,6 +144,11 @@ const SyncHistoryComponent: React.FC<SyncHistoryProps> = ({ accountId, refreshTr
           {sync.details.syncMethod && (
             <Typography variant="body2" color="text.secondary">
               Sync method: {getSyncMethodLabel(sync.details.syncMethod)}
+            </Typography>
+          )}
+          {sync.details.sourceFilter && Array.isArray(sync.details.sourceFilter) && sync.details.sourceFilter.length > 0 && (
+            <Typography variant="body2" color="text.secondary">
+              Source filter: {sync.details.sourceFilter.join(', ')}
             </Typography>
           )}
           {sync.details.jobStatusBreakdown && (

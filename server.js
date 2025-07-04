@@ -521,15 +521,51 @@ app.post("/api/sync-jobs/:accountId", async (req, res) => {
     }
 
     console.log(`📋 Processing ${data.data.length} jobs from Workiz`);
+    console.log(
+      `📋 Account sourceFilter: ${JSON.stringify(account.sourceFilter)}`
+    );
 
-    // Add accountId to each job
-    const jobs = data.data.map((job) => ({
+    // Filter jobs by sourceFilter if configured
+    let filteredJobs = data.data;
+    if (
+      account.sourceFilter &&
+      Array.isArray(account.sourceFilter) &&
+      account.sourceFilter.length > 0
+    ) {
+      filteredJobs = data.data.filter((job) =>
+        account.sourceFilter.includes(job.JobSource)
+      );
+      console.log(
+        `🔍 Filtered jobs by sourceFilter: ${data.data.length} → ${filteredJobs.length} jobs`
+      );
+    } else {
+      console.log(
+        `⚠️ No sourceFilter configured, using all ${data.data.length} jobs`
+      );
+    }
+
+    if (filteredJobs.length === 0) {
+      console.log(`⚠️ No jobs match the sourceFilter criteria`);
+      return res.json({
+        message: `No jobs match the sourceFilter criteria for account ${
+          account.name || "Unknown"
+        }`,
+        details: {
+          jobsFromWorkiz: data.data.length,
+          filteredJobs: 0,
+          sourceFilter: account.sourceFilter,
+        },
+      });
+    }
+
+    // Add accountId to each filtered job
+    const jobs = filteredJobs.map((job) => ({
       ...job,
       accountId: account._id || account.id,
     }));
 
     console.log(
-      `🏷️ Added accountId to jobs. Sample job UUIDs: ${jobs
+      `🏷️ Added accountId to filtered jobs. Sample job UUIDs: ${jobs
         .slice(0, 3)
         .map((j) => j.UUID)
         .join(", ")}`
@@ -732,13 +768,15 @@ app.post("/api/sync-jobs/:accountId", async (req, res) => {
       timestamp: new Date(),
       duration: Date.now() - accountStartTime,
       details: {
-        jobsFromWorkiz: jobs.length,
+        jobsFromWorkiz: data.data.length,
+        filteredJobs: jobs.length,
         existingJobsFound: existingJobs.length,
         finalJobCount: finalJobCount,
         jobsUpdated: updatedJobsCount,
         jobsDeleted: deletedJobsCount,
         failedUpdates: failedUpdatesCount,
         syncMethod: "manual",
+        sourceFilter: account.sourceFilter,
         jobStatusBreakdown: {
           submitted: jobs.filter((j) => j.Status === "Submitted").length,
           pending: jobs.filter((j) => j.Status === "Pending").length,
@@ -774,12 +812,14 @@ app.post("/api/sync-jobs/:accountId", async (req, res) => {
         account.name || "Unknown"
       }`,
       details: {
-        jobsFromWorkiz: jobs.length,
+        jobsFromWorkiz: data.data.length,
+        filteredJobs: jobs.length,
         existingJobsFound: existingJobs.length,
         finalJobCount: finalJobCount,
         jobsUpdated: updatedJobsCount,
         jobsDeleted: deletedJobsCount,
         failedUpdates: failedUpdatesCount,
+        sourceFilter: account.sourceFilter,
       },
     });
   } catch (error) {
@@ -1560,8 +1600,41 @@ app.get("/api/cron/sync-jobs", async (req, res) => {
           throw new Error("Invalid response structure from Workiz API");
         }
 
-        // Add accountId to each job
-        const jobs = data.data.map((job) => ({
+        console.log(
+          `📋 Processing ${data.data.length} jobs from Workiz for ${account.name}`
+        );
+        console.log(
+          `📋 Account sourceFilter: ${JSON.stringify(account.sourceFilter)}`
+        );
+
+        // Filter jobs by sourceFilter if configured
+        let filteredJobs = data.data;
+        if (
+          account.sourceFilter &&
+          Array.isArray(account.sourceFilter) &&
+          account.sourceFilter.length > 0
+        ) {
+          filteredJobs = data.data.filter((job) =>
+            account.sourceFilter.includes(job.JobSource)
+          );
+          console.log(
+            `🔍 Filtered jobs by sourceFilter: ${data.data.length} → ${filteredJobs.length} jobs`
+          );
+        } else {
+          console.log(
+            `⚠️ No sourceFilter configured, using all ${data.data.length} jobs`
+          );
+        }
+
+        if (filteredJobs.length === 0) {
+          console.log(
+            `⚠️ No jobs match the sourceFilter criteria for ${account.name}`
+          );
+          continue; // Skip to next account
+        }
+
+        // Add accountId to each filtered job
+        const jobs = filteredJobs.map((job) => ({
           ...job,
           accountId: account._id || account.id,
         }));
@@ -1750,7 +1823,8 @@ app.get("/api/cron/sync-jobs", async (req, res) => {
         console.log(
           `📊 Sync summary for ${account.name} (${accountDuration}ms):`
         );
-        console.log(`   - Jobs from Workiz: ${jobs.length}`);
+        console.log(`   - Jobs from Workiz: ${data.data.length}`);
+        console.log(`   - Filtered jobs: ${jobs.length}`);
         console.log(`   - Updated: ${updatedJobsCount} jobs`);
         console.log(`   - Deleted (old): ${deletedJobsCount} jobs`);
         console.log(`   - Failed updates: ${failedUpdatesCount} jobs`);
@@ -1764,12 +1838,14 @@ app.get("/api/cron/sync-jobs", async (req, res) => {
           timestamp: new Date(),
           duration: accountDuration,
           details: {
-            jobsFromWorkiz: jobs.length,
+            jobsFromWorkiz: data.data.length,
+            filteredJobs: jobs.length,
             finalJobCount: finalJobCount,
             jobsUpdated: updatedJobsCount,
             jobsDeleted: deletedJobsCount,
             failedUpdates: failedUpdatesCount,
             syncMethod: "cron",
+            sourceFilter: account.sourceFilter,
             jobStatusBreakdown: {
               submitted: jobs.filter((j) => j.Status === "Submitted").length,
               pending: jobs.filter((j) => j.Status === "Pending").length,
@@ -1805,10 +1881,12 @@ app.get("/api/cron/sync-jobs", async (req, res) => {
           account: account.name,
           success: true,
           duration: accountDuration,
+          jobsFromWorkiz: data.data.length,
           jobsSynced: jobs.length,
           jobsUpdated: updatedJobsCount,
           jobsDeleted: deletedJobsCount,
           failedUpdates: failedUpdatesCount,
+          sourceFilter: account.sourceFilter,
         });
       } catch (error) {
         const accountDuration = Date.now() - accountStartTime;
