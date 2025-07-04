@@ -520,10 +520,7 @@ app.post("/api/sync-jobs/:accountId", async (req, res) => {
         .json({ error: "Invalid response from Workiz API" });
     }
 
-    console.log(`📋 Processing ${data.data.length} jobs from Workiz`);
-    console.log(
-      `📋 Account sourceFilter: ${JSON.stringify(account.sourceFilter)}`
-    );
+    // Processing jobs from Workiz (logging simplified for Vercel)
 
     // Filter jobs by sourceFilter if configured
     let filteredJobs = data.data;
@@ -634,9 +631,7 @@ app.post("/api/sync-jobs/:accountId", async (req, res) => {
       const batchNumber = Math.floor(i / BATCH_SIZE) + 1;
       const totalBatches = Math.ceil(existingJobs.length / BATCH_SIZE);
 
-      console.log(
-        `📦 Processing batch ${batchNumber}/${totalBatches} (${batch.length} jobs)`
-      );
+      console.log(`Batch ${batchNumber}/${totalBatches}: ${batch.length} jobs`);
 
       // Process each job in the current batch
       for (const existingJob of batch) {
@@ -1517,8 +1512,10 @@ app.post("/api/trigger-sync/:accountId", async (req, res) => {
   }
 });
 
-// Cron job endpoint
+// Cron job endpoint - Now uses parallel sync approach
 app.get("/api/cron/sync-jobs", async (req, res) => {
+  const startTime = Date.now();
+
   try {
     // Enhanced security validation
     const userAgent = req.get("User-Agent");
@@ -1537,7 +1534,7 @@ app.get("/api/cron/sync-jobs", async (req, res) => {
     }
 
     console.log(`🕐 Vercel Cron Job triggered at: ${new Date().toISOString()}`);
-    console.log(`📊 Starting enhanced sync process...`);
+    console.log(`📊 Starting parallel sync process...`);
 
     // Ensure database connection with health check
     const db = await ensureDbConnection();
@@ -1556,56 +1553,79 @@ app.get("/api/cron/sync-jobs", async (req, res) => {
       });
     }
 
-    console.log(`📋 Found ${accounts.length} accounts to sync`);
+    console.log(`📋 Found ${accounts.length} accounts for parallel processing`);
 
-    const syncResults = [];
-    const startTime = Date.now();
+    // Create sync session for tracking (same as parallel sync)
+    const syncSession = {
+      sessionId: `cron_sync_${Date.now()}_${Math.random()
+        .toString(36)
+        .substr(2, 9)}`,
+      startTime: new Date(),
+      totalAccounts: accounts.length,
+      accounts: accounts.map((account) => ({
+        accountId: account._id,
+        accountName: account.name,
+        status: "pending",
+        progress: 0,
+        batches: [],
+        totalJobs: 0,
+        processedJobs: 0,
+      })),
+      overallStatus: "initializing",
+      createdAt: new Date(),
+      syncMethod: "cron",
+    };
 
-    // Process accounts with enhanced error handling
-    for (const [index, account] of accounts.entries()) {
+    // Store sync session
+    await db.collection("syncSessions").insertOne(syncSession);
+
+    console.log(`📋 Created cron sync session: ${syncSession.sessionId}`);
+
+    // Process all accounts in parallel using the same logic as manual parallel sync
+    const accountPromises = accounts.map(async (account) => {
       const accountStartTime = Date.now();
-      console.log(
-        `⏰ Processing account ${index + 1}/${accounts.length}: ${account.name}`
-      );
+      console.log(`Processing account: ${account.name}`);
 
       try {
-        // Enhanced API call with timeout and retry
-        const workizUrl = `https://api.workiz.com/api/v1/${account.workizApiToken}/job/all/?start_date=2025-01-01&offset=0&records=100&only_open=false`;
+        // Update session status
+        await db.collection("syncSessions").updateOne(
+          {
+            sessionId: syncSession.sessionId,
+            "accounts.accountId": account._id,
+          },
+          {
+            $set: {
+              "accounts.$.status": "processing",
+              "accounts.$.startTime": new Date(),
+            },
+          }
+        );
+
+        // Fetch jobs from Workiz (same logic as parallel sync)
+        const startDate = new Date();
+        startDate.setDate(startDate.getDate() - 14);
+        const formattedStartDate = startDate.toISOString().split("T")[0];
+
+        const workizUrl = `https://api.workiz.com/api/v1/${account.workizApiToken}/job/all/?start_date=${formattedStartDate}&offset=0&records=100&only_open=true`;
 
         const response = await RetryHandler.withRetry(
-          async () => {
-            const resp = await APIManager.fetchWithTimeout(
-              workizUrl,
-              {},
-              45000
-            );
-
-            if (!resp.ok) {
-              const errorText = await resp.text();
-              console.log(`❌ Workiz API error: ${resp.status} - ${errorText}`);
-              throw new Error(
-                `Workiz API error: ${resp.status} - ${errorText}`
-              );
-            }
-
-            return resp;
-          },
-          5,
+          () => APIManager.fetchWithTimeout(workizUrl, {}, 30000),
+          3,
           2000,
           workizCircuitBreaker
-        ); // 5 retries, 2s base delay, with circuit breaker
+        );
 
-        const data = await response.json();
-        if (!data.flag || !Array.isArray(data.data)) {
-          throw new Error("Invalid response structure from Workiz API");
+        if (!response.ok) {
+          throw new Error(
+            `Workiz API error: ${response.status} ${response.statusText}`
+          );
         }
 
-        console.log(
-          `📋 Processing ${data.data.length} jobs from Workiz for ${account.name}`
-        );
-        console.log(
-          `📋 Account sourceFilter: ${JSON.stringify(account.sourceFilter)}`
-        );
+        const data = await response.json();
+
+        if (!data.flag || !data.data) {
+          throw new Error("Invalid response from Workiz API");
+        }
 
         // Filter jobs by sourceFilter if configured
         let filteredJobs = data.data;
@@ -1618,221 +1638,192 @@ app.get("/api/cron/sync-jobs", async (req, res) => {
             account.sourceFilter.includes(job.JobSource)
           );
           console.log(
-            `🔍 Filtered jobs by sourceFilter: ${data.data.length} → ${filteredJobs.length} jobs`
+            `Filtered: ${data.data.length} → ${filteredJobs.length} jobs`
           );
         } else {
-          console.log(
-            `⚠️ No sourceFilter configured, using all ${data.data.length} jobs`
-          );
+          console.log(`Using all ${data.data.length} jobs (no filter)`);
         }
 
-        if (filteredJobs.length === 0) {
-          console.log(
-            `⚠️ No jobs match the sourceFilter criteria for ${account.name}`
-          );
-          continue; // Skip to next account
-        }
-
-        // Add accountId to each filtered job
+        // Add accountId to each job
         const jobs = filteredJobs.map((job) => ({
           ...job,
-          accountId: account._id || account.id,
+          accountId: account._id,
         }));
 
-        // Enhanced bulk operations with error handling
-        const bulkOps = jobs.map((job) => ({
-          updateOne: {
-            filter: { UUID: job.UUID },
-            update: { $set: job },
-            upsert: true,
-          },
-        }));
-
-        if (bulkOps.length > 0) {
-          const bulkResult = await RetryHandler.withRetry(async () => {
-            return await db.collection("jobs").bulkWrite(bulkOps);
-          });
-
-          console.log(
-            `✅ Jobs sync completed for ${account.name}: ${bulkResult.upsertedCount} new, ${bulkResult.modifiedCount} updated`
-          );
+        // Split jobs into batches (same as parallel sync)
+        const batchSize = 29;
+        const batches = [];
+        for (let i = 0; i < jobs.length; i += batchSize) {
+          batches.push(jobs.slice(i, i + batchSize));
         }
 
-        // Enhanced job update and cleanup process
-        console.log(
-          `🔄 Starting job update and cleanup process for ${account.name}...`
+        // Update session with batch info
+        await db.collection("syncSessions").updateOne(
+          {
+            sessionId: syncSession.sessionId,
+            "accounts.accountId": account._id,
+          },
+          {
+            $set: {
+              "accounts.$.totalJobs": jobs.length,
+              "accounts.$.totalBatches": batches.length,
+              "accounts.$.batches": batches.map((batch, index) => ({
+                batchIndex: index,
+                jobCount: batch.length,
+                status: "pending",
+                uuids: batch.map((job) => job.UUID),
+              })),
+            },
+          }
         );
 
-        const accountId = account._id || account.id;
-        const existingJobs = await RetryHandler.withRetry(async () => {
-          return await db.collection("jobs").find({ accountId }).toArray();
-        });
-
-        console.log(
-          `📋 Found ${existingJobs.length} existing jobs in database`
-        );
-
-        // Calculate 1-year cutoff date
-        const oneYearAgo = new Date();
-        oneYearAgo.setDate(oneYearAgo.getDate() - 365);
-
+        // Process batches with rate limiting (same as parallel sync)
+        let processedJobs = 0;
         let updatedJobsCount = 0;
-        let deletedJobsCount = 0;
         let failedUpdatesCount = 0;
 
-        // Process jobs in batches to avoid memory issues and rate limiting
-        const BATCH_SIZE = 29;
-        const DELAY_BETWEEN_BATCHES = 60000; // 60 seconds in milliseconds
+        for (let batchIndex = 0; batchIndex < batches.length; batchIndex++) {
+          const batch = batches[batchIndex];
+          const batchStartTime = Date.now();
 
-        for (let i = 0; i < existingJobs.length; i += BATCH_SIZE) {
-          const batch = existingJobs.slice(i, i + BATCH_SIZE);
-          const batchNumber = Math.floor(i / BATCH_SIZE) + 1;
-          const totalBatches = Math.ceil(existingJobs.length / BATCH_SIZE);
-
-          console.log(
-            `📦 Processing batch ${batchNumber}/${totalBatches} (${batch.length} jobs)`
+          // Update batch status
+          await db.collection("syncSessions").updateOne(
+            {
+              sessionId: syncSession.sessionId,
+              "accounts.accountId": account._id,
+              "accounts.batches.batchIndex": batchIndex,
+            },
+            {
+              $set: {
+                "accounts.$.batches.$.status": "processing",
+                "accounts.$.batches.$.startTime": new Date(),
+              },
+            }
           );
 
-          // Process each job in the current batch
-          for (const existingJob of batch) {
+          // Process each job in the batch with individual API calls
+          for (let jobIndex = 0; jobIndex < batch.length; jobIndex++) {
+            const job = batch[jobIndex];
+
             try {
-              const jobDate = new Date(existingJob.JobDateTime);
+              // Fetch detailed job data
+              const detailUrl = `https://api.workiz.com/api/v1/${account.workizApiToken}/job/get/${job.UUID}/`;
 
-              // Check if job is older than 1 year
-              if (jobDate < oneYearAgo) {
-                console.log(
-                  `🗑️ Deleting old job: ${existingJob.UUID} (${existingJob.JobDateTime})`
-                );
-                await RetryHandler.withRetry(async () => {
-                  await db
-                    .collection("jobs")
-                    .deleteOne({ UUID: existingJob.UUID });
-                });
-                deletedJobsCount++;
-                continue;
-              }
-
-              // Update job using Workiz API
-              console.log(`🔄 Updating job: ${existingJob.UUID}`);
-              const updateUrl = `https://api.workiz.com/api/v1/${account.workizApiToken}/job/get/${existingJob.UUID}/`;
-
-              const updateResponse = await RetryHandler.withRetry(
-                async () => {
-                  const resp = await APIManager.fetchWithTimeout(
-                    updateUrl,
-                    {},
-                    30000
-                  );
-
-                  if (!resp.ok) {
-                    const errorText = await resp.text();
-                    console.log(
-                      `❌ Job update error: ${resp.status} - ${errorText}`
-                    );
-
-                    // Check if response is HTML (520 error page)
-                    if (
-                      errorText.includes('<div class="text-container">') ||
-                      errorText.includes("Oops!") ||
-                      errorText.includes("Something went wrong")
-                    ) {
-                      console.log(
-                        `🚨 Detected HTML error page from Workiz API (likely 520 error)`
-                      );
-                      throw new Error(
-                        `Workiz API 520 error - server is experiencing issues`
-                      );
-                    }
-
-                    throw new Error(
-                      `Job update error: ${resp.status} - ${errorText}`
-                    );
-                  }
-
-                  return resp;
-                },
+              const detailResponse = await RetryHandler.withRetry(
+                () => APIManager.fetchWithTimeout(detailUrl, {}, 30000),
                 3,
-                1000,
+                2000,
                 workizCircuitBreaker
-              ); // 3 retries, 1s base delay, with circuit breaker
+              );
 
-              if (updateResponse.ok) {
-                const updateData = await updateResponse.json();
-
-                if (updateData.flag && updateData.data) {
-                  // Update the job with fresh data from Workiz
-                  const updatedJob = {
-                    ...updateData.data,
-                    accountId: account._id || account.id,
-                  };
-
-                  await RetryHandler.withRetry(async () => {
-                    await db
-                      .collection("jobs")
-                      .updateOne(
-                        { UUID: existingJob.UUID },
-                        { $set: updatedJob }
-                      );
-                  });
-
-                  updatedJobsCount++;
-                  console.log(`✅ Updated job: ${existingJob.UUID}`);
-                } else {
-                  console.log(
-                    `⚠️ Job not found in Workiz API: ${existingJob.UUID}`
-                  );
-                  // Job might have been deleted in Workiz, so delete from our database
-                  await RetryHandler.withRetry(async () => {
-                    await db
-                      .collection("jobs")
-                      .deleteOne({ UUID: existingJob.UUID });
-                  });
-                  deletedJobsCount++;
-                }
-              } else {
-                console.log(
-                  `❌ Failed to update job ${existingJob.UUID}: ${updateResponse.status}`
+              if (!detailResponse.ok) {
+                throw new Error(
+                  `Workiz API error: ${detailResponse.status} ${detailResponse.statusText}`
                 );
-                failedUpdatesCount++;
               }
 
-              // Add a small delay between individual job updates (100ms)
-              await new Promise((resolve) => setTimeout(resolve, 100));
+              const detailData = await detailResponse.json();
+
+              if (!detailData.flag || !detailData.data) {
+                throw new Error(
+                  "Invalid response from Workiz API for job details"
+                );
+              }
+
+              const detailedJob = {
+                ...detailData.data,
+                accountId: account._id,
+                lastUpdated: new Date(),
+              };
+
+              // Update or insert job in database
+              const result = await db
+                .collection("jobs")
+                .updateOne(
+                  { UUID: job.UUID, accountId: account._id },
+                  { $set: detailedJob },
+                  { upsert: true }
+                );
+
+              updatedJobsCount++;
+              processedJobs++;
+
+              // Rate limiting: 2-second delay between API calls (30 calls per minute)
+              if (jobIndex < batch.length - 1) {
+                await new Promise((resolve) => setTimeout(resolve, 2000));
+              }
             } catch (error) {
-              console.log(
-                `❌ Error processing job ${existingJob.UUID}: ${error.message}`
-              );
               failedUpdatesCount++;
+              processedJobs++;
             }
           }
 
-          // Add delay between batches (except for the last batch)
-          if (i + BATCH_SIZE < existingJobs.length) {
-            console.log(`⏳ Waiting 60 seconds before next batch...`);
-            await new Promise((resolve) =>
-              setTimeout(resolve, DELAY_BETWEEN_BATCHES)
-            );
-          }
+          const batchDuration = Date.now() - batchStartTime;
+          console.log(
+            `Batch ${batchIndex + 1}/${batches.length}: ${
+              batch.length
+            } jobs, ${updatedJobsCount} updated, ${failedUpdatesCount} failed`
+          );
+
+          // Update batch status
+          await db.collection("syncSessions").updateOne(
+            {
+              sessionId: syncSession.sessionId,
+              "accounts.accountId": account._id,
+              "accounts.batches.batchIndex": batchIndex,
+            },
+            {
+              $set: {
+                "accounts.$.batches.$.status": "completed",
+                "accounts.$.batches.$.endTime": new Date(),
+                "accounts.$.batches.$.duration": batchDuration,
+                "accounts.$.batches.$.processedJobs": batch.length,
+                "accounts.$.batches.$.failedJobs":
+                  batch.length - updatedJobsCount,
+              },
+            }
+          );
+
+          // Update overall progress
+          await db.collection("syncSessions").updateOne(
+            {
+              sessionId: syncSession.sessionId,
+              "accounts.accountId": account._id,
+            },
+            {
+              $set: {
+                "accounts.$.processedJobs": processedJobs,
+                "accounts.$.progress": Math.round(
+                  (processedJobs / jobs.length) * 100
+                ),
+              },
+            }
+          );
         }
 
-        const finalJobCount = await RetryHandler.withRetry(async () => {
-          return await db.collection("jobs").countDocuments({ accountId });
-        });
-
         const accountDuration = Date.now() - accountStartTime;
-        console.log(
-          `📊 Sync summary for ${account.name} (${accountDuration}ms):`
-        );
-        console.log(`   - Jobs from Workiz: ${data.data.length}`);
-        console.log(`   - Filtered jobs: ${jobs.length}`);
-        console.log(`   - Updated: ${updatedJobsCount} jobs`);
-        console.log(`   - Deleted (old): ${deletedJobsCount} jobs`);
-        console.log(`   - Failed updates: ${failedUpdatesCount} jobs`);
-        console.log(`   - Final job count: ${finalJobCount} jobs`);
 
-        // Enhanced sync history recording
+        // Update final account status
+        await db.collection("syncSessions").updateOne(
+          {
+            sessionId: syncSession.sessionId,
+            "accounts.accountId": account._id,
+          },
+          {
+            $set: {
+              "accounts.$.status": "completed",
+              "accounts.$.endTime": new Date(),
+              "accounts.$.duration": accountDuration,
+              "accounts.$.processedJobs": processedJobs,
+              "accounts.$.updatedJobs": updatedJobsCount,
+              "accounts.$.failedJobs": failedUpdatesCount,
+            },
+          }
+        );
+
+        // Record sync history
         const syncHistoryRecord = {
-          accountId: account._id || account.id,
+          accountId: account._id,
           syncType: "jobs",
           status: "success",
           timestamp: new Date(),
@@ -1840,9 +1831,9 @@ app.get("/api/cron/sync-jobs", async (req, res) => {
           details: {
             jobsFromWorkiz: data.data.length,
             filteredJobs: jobs.length,
-            finalJobCount: finalJobCount,
+            totalBatches: batches.length,
+            batchSize: batchSize,
             jobsUpdated: updatedJobsCount,
-            jobsDeleted: deletedJobsCount,
             failedUpdates: failedUpdatesCount,
             syncMethod: "cron",
             sourceFilter: account.sourceFilter,
@@ -1855,7 +1846,7 @@ app.get("/api/cron/sync-jobs", async (req, res) => {
                   j.Status === "done pending approval"
               ).length,
               cancelled: jobs.filter((j) =>
-                ["Cancelled", "Canceled", "cancelled", "CANCELLED"].includes(
+                ["Cancelled", "Canceled", "Cancelled by Customer"].includes(
                   j.Status
                 )
               ).length,
@@ -1863,78 +1854,89 @@ app.get("/api/cron/sync-jobs", async (req, res) => {
           },
         };
 
-        await RetryHandler.withRetry(async () => {
-          await db.collection("syncHistory").insertOne(syncHistoryRecord);
-        });
+        await db.collection("syncHistory").insertOne(syncHistoryRecord);
 
-        // Update account's lastSyncDate
-        await RetryHandler.withRetry(async () => {
-          await db
-            .collection("accounts")
-            .updateOne(
-              { _id: account._id || new ObjectId(account.id) },
-              { $set: { lastSyncDate: new Date() } }
-            );
-        });
+        console.log(
+          `Account ${account.name} done: ${jobs.length} jobs, ${updatedJobsCount} updated, ${failedUpdatesCount} failed, ${accountDuration}ms`
+        );
 
-        syncResults.push({
+        return {
           account: account.name,
           success: true,
           duration: accountDuration,
-          jobsFromWorkiz: data.data.length,
           jobsSynced: jobs.length,
           jobsUpdated: updatedJobsCount,
-          jobsDeleted: deletedJobsCount,
           failedUpdates: failedUpdatesCount,
-          sourceFilter: account.sourceFilter,
-        });
+        };
       } catch (error) {
-        const accountDuration = Date.now() - accountStartTime;
-        console.log(
-          `❌ Sync failed for account ${account.name} (${accountDuration}ms):`,
-          error.message
+        console.error(`Error processing account ${account.name}:`, error);
+
+        // Update account status to failed
+        await db.collection("syncSessions").updateOne(
+          {
+            sessionId: syncSession.sessionId,
+            "accounts.accountId": account._id,
+          },
+          {
+            $set: {
+              "accounts.$.status": "failed",
+              "accounts.$.error": error.message,
+              "accounts.$.endTime": new Date(),
+            },
+          }
         );
 
-        // Enhanced failed sync history recording
-        const syncHistoryRecord = {
-          accountId: account._id || account.id,
-          syncType: "jobs",
-          status: "error",
-          timestamp: new Date(),
-          duration: accountDuration,
-          errorMessage: error.message,
-          errorStack: error.stack,
-          details: {},
-        };
-
-        try {
-          await db.collection("syncHistory").insertOne(syncHistoryRecord);
-        } catch (historyError) {
-          console.error(
-            "❌ Failed to record sync history:",
-            historyError.message
-          );
-        }
-
-        syncResults.push({
+        return {
           account: account.name,
           success: false,
-          duration: accountDuration,
+          duration: Date.now() - accountStartTime,
           error: error.message,
-        });
+        };
       }
-    }
+    });
+
+    // Wait for all accounts to complete
+    const results = await Promise.allSettled(accountPromises);
+
+    // Process results
+    const syncResults = results.map((result, index) => {
+      if (result.status === "fulfilled") {
+        return result.value;
+      } else {
+        return {
+          account: accounts[index]?.name || `Account ${index}`,
+          success: false,
+          duration: 0,
+          error: result.reason?.message || "Unknown error",
+        };
+      }
+    });
 
     const totalDuration = Date.now() - startTime;
     const successfulSyncs = syncResults.filter((r) => r.success).length;
     const failedSyncs = syncResults.filter((r) => !r.success).length;
 
-    console.log(`🎯 Enhanced cron job completed in ${totalDuration}ms:`);
+    // Update overall session status
+    await db.collection("syncSessions").updateOne(
+      { sessionId: syncSession.sessionId },
+      {
+        $set: {
+          overallStatus: "completed",
+          endTime: new Date(),
+          duration: totalDuration,
+          successfulAccounts: successfulSyncs,
+          failedAccounts: failedSyncs,
+        },
+      }
+    );
+
+    console.log(`🎯 Cron parallel sync completed in ${totalDuration}ms:`);
     console.log(`   - Successful: ${successfulSyncs} accounts`);
     console.log(`   - Failed: ${failedSyncs} accounts`);
 
     res.json({
-      message: `Enhanced cron job completed: ${successfulSyncs} successful, ${failedSyncs} failed`,
+      message: `Cron parallel sync completed: ${successfulSyncs} successful, ${failedSyncs} failed`,
+      sessionId: syncSession.sessionId,
       duration: totalDuration,
       results: syncResults,
       timestamp: new Date().toISOString(),
@@ -1942,7 +1944,7 @@ app.get("/api/cron/sync-jobs", async (req, res) => {
   } catch (error) {
     const duration = Date.now() - startTime;
     console.log(
-      `❌ Enhanced cron job error after ${duration}ms: ${error.message}`
+      `❌ Cron parallel sync error after ${duration}ms: ${error.message}`
     );
     console.error("Full error:", error);
 
@@ -1954,8 +1956,10 @@ app.get("/api/cron/sync-jobs", async (req, res) => {
   }
 });
 
-// Cron job endpoint for Google Sheets sync
+// Cron job endpoint for Google Sheets sync - Now uses parallel processing
 app.get("/api/cron/sync-sheets", async (req, res) => {
+  const startTime = Date.now();
+
   try {
     // Enhanced security validation
     const userAgent = req.get("User-Agent");
@@ -1976,7 +1980,7 @@ app.get("/api/cron/sync-sheets", async (req, res) => {
     console.log(
       `🕐 Vercel Cron Job for Google Sheets sync triggered at: ${new Date().toISOString()}`
     );
-    console.log(`📊 Starting Google Sheets sync process...`);
+    console.log(`📊 Starting parallel Google Sheets sync process...`);
 
     // Ensure database connection with health check
     const db = await ensureDbConnection();
@@ -2001,11 +2005,8 @@ app.get("/api/cron/sync-sheets", async (req, res) => {
     }
 
     console.log(
-      `📋 Found ${accounts.length} accounts with Google Sheets ID to sync`
+      `📋 Found ${accounts.length} accounts with Google Sheets ID for parallel processing`
     );
-
-    const syncResults = [];
-    const startTime = Date.now();
 
     // Parse Google Sheets credentials once
     let credentials;
@@ -2039,14 +2040,10 @@ app.get("/api/cron/sync-sheets", async (req, res) => {
     const sheets = google.sheets({ version: "v4", auth });
     console.log(`🔐 Google Sheets client initialized`);
 
-    // Process accounts with enhanced error handling
-    for (const [index, account] of accounts.entries()) {
+    // Process all accounts in parallel
+    const accountPromises = accounts.map(async (account) => {
       const accountStartTime = Date.now();
-      console.log(
-        `⏰ Processing Google Sheets sync for account ${index + 1}/${
-          accounts.length
-        }: ${account.name}`
-      );
+      console.log(`Processing Google Sheets sync for account: ${account.name}`);
 
       try {
         // Get all jobs for this account
@@ -2084,14 +2081,13 @@ app.get("/api/cron/sync-sheets", async (req, res) => {
           console.log(
             `⚠️ No jobs match the sourceFilter criteria for ${account.name}`
           );
-          syncResults.push({
+          return {
             account: account.name,
             success: true,
             duration: Date.now() - accountStartTime,
             jobsSynced: 0,
             message: "No jobs to sync",
-          });
-          continue;
+          };
         }
 
         // Clear the sheet first (skip header row)
@@ -2242,13 +2238,13 @@ app.get("/api/cron/sync-sheets", async (req, res) => {
           `   - Updated rows: ${response.data.updates?.updatedRows || 0}`
         );
 
-        syncResults.push({
+        return {
           account: account.name,
           success: true,
           duration: accountDuration,
           jobsSynced: filteredJobs.length,
           updatedRows: response.data.updates?.updatedRows || 0,
-        });
+        };
       } catch (error) {
         const accountDuration = Date.now() - accountStartTime;
         console.log(
@@ -2277,25 +2273,44 @@ app.get("/api/cron/sync-sheets", async (req, res) => {
           );
         }
 
-        syncResults.push({
+        return {
           account: account.name,
           success: false,
           duration: accountDuration,
           error: error.message,
-        });
+        };
       }
-    }
+    });
+
+    // Wait for all accounts to complete
+    const results = await Promise.allSettled(accountPromises);
+
+    // Process results
+    const syncResults = results.map((result, index) => {
+      if (result.status === "fulfilled") {
+        return result.value;
+      } else {
+        return {
+          account: accounts[index]?.name || `Account ${index}`,
+          success: false,
+          duration: 0,
+          error: result.reason?.message || "Unknown error",
+        };
+      }
+    });
 
     const totalDuration = Date.now() - startTime;
     const successfulSyncs = syncResults.filter((r) => r.success).length;
     const failedSyncs = syncResults.filter((r) => !r.success).length;
 
-    console.log(`🎯 Google Sheets cron job completed in ${totalDuration}ms:`);
+    console.log(
+      `🎯 Google Sheets parallel cron job completed in ${totalDuration}ms:`
+    );
     console.log(`   - Successful: ${successfulSyncs} accounts`);
     console.log(`   - Failed: ${failedSyncs} accounts`);
 
     res.json({
-      message: `Google Sheets cron job completed: ${successfulSyncs} successful, ${failedSyncs} failed`,
+      message: `Google Sheets parallel cron job completed: ${successfulSyncs} successful, ${failedSyncs} failed`,
       duration: totalDuration,
       results: syncResults,
       timestamp: new Date().toISOString(),
@@ -2514,3 +2529,545 @@ connectToMongoDB().then(() => {
 
 // Export for Vercel serverless functions
 export default app;
+
+// ============================================================================
+// PARALLEL ACCOUNT PROCESSING ENDPOINTS
+// ============================================================================
+
+// Initialize parallel sync for all accounts
+app.post("/api/sync/parallel/init", async (req, res) => {
+  const startTime = Date.now();
+  console.log("🚀 Starting parallel account sync initialization...");
+
+  try {
+    await ensureDbConnection();
+
+    // Get all accounts
+    const accounts = await db.collection("accounts").find({}).toArray();
+
+    if (accounts.length === 0) {
+      return res.status(404).json({
+        error: "No accounts found",
+        message: "Please create at least one account before starting sync",
+      });
+    }
+
+    console.log(`📊 Found ${accounts.length} accounts for parallel processing`);
+
+    // Create sync session for tracking
+    const syncSession = {
+      sessionId: `sync_${Date.now()}_${Math.random()
+        .toString(36)
+        .substr(2, 9)}`,
+      startTime: new Date(),
+      totalAccounts: accounts.length,
+      accounts: accounts.map((account) => ({
+        accountId: account._id,
+        accountName: account.name,
+        status: "pending",
+        progress: 0,
+        batches: [],
+        totalJobs: 0,
+        processedJobs: 0,
+      })),
+      overallStatus: "initializing",
+      createdAt: new Date(),
+    };
+
+    // Store sync session
+    await db.collection("syncSessions").insertOne(syncSession);
+
+    console.log(`📋 Created sync session: ${syncSession.sessionId}`);
+
+    // Return session info for client to start processing
+    res.json({
+      message: "Parallel sync initialized successfully",
+      sessionId: syncSession.sessionId,
+      totalAccounts: accounts.length,
+      accounts: syncSession.accounts.map((acc) => ({
+        accountId: acc.accountId,
+        accountName: acc.accountName,
+        status: acc.status,
+      })),
+      nextStep: "Start processing accounts in parallel",
+    });
+  } catch (error) {
+    console.error("❌ Error initializing parallel sync:", error);
+    res.status(500).json({
+      error: "Failed to initialize parallel sync",
+      message: error.message,
+    });
+  }
+});
+
+// Process a single account's jobs in batches
+app.post("/api/sync/parallel/account/:accountId", async (req, res) => {
+  const { accountId } = req.params;
+  const { sessionId, batchSize = 29, delayMs = 2000 } = req.body;
+
+  const accountStartTime = Date.now();
+  console.log(`🔄 Starting account processing: ${accountId}`);
+
+  try {
+    await ensureDbConnection();
+
+    // Get account details
+    const account = await db.collection("accounts").findOne({
+      _id: new ObjectId(accountId),
+    });
+
+    if (!account) {
+      return res.status(404).json({
+        error: "Account not found",
+        accountId,
+      });
+    }
+
+    console.log(`📋 Processing account: ${account.name}`);
+
+    // Update session status
+    if (sessionId) {
+      await db.collection("syncSessions").updateOne(
+        { sessionId, "accounts.accountId": accountId },
+        {
+          $set: {
+            "accounts.$.status": "processing",
+            "accounts.$.startTime": new Date(),
+          },
+        }
+      );
+    }
+
+    // Fetch jobs from Workiz
+    const startDate = new Date();
+    startDate.setDate(startDate.getDate() - 14);
+    const formattedStartDate = startDate.toISOString().split("T")[0];
+
+    const workizUrl = `https://api.workiz.com/api/v1/${account.workizToken}/job/all/?start_date=${formattedStartDate}&offset=0&records=100&only_open=true`;
+
+    console.log(`🌐 Fetching jobs from Workiz for ${account.name}...`);
+
+    const response = await RetryHandler.withRetry(
+      () => APIManager.fetchWithTimeout(workizUrl, {}, 30000),
+      3,
+      2000,
+      workizCircuitBreaker
+    );
+
+    if (!response.ok) {
+      throw new Error(
+        `Workiz API error: ${response.status} ${response.statusText}`
+      );
+    }
+
+    const data = await response.json();
+
+    if (!data.flag || !data.data) {
+      throw new Error("Invalid response from Workiz API");
+    }
+
+    console.log(
+      `📋 Processing ${data.data.length} jobs from Workiz for ${account.name}`
+    );
+    console.log(
+      `📋 Account sourceFilter: ${JSON.stringify(account.sourceFilter)}`
+    );
+
+    // Filter jobs by sourceFilter if configured
+    let filteredJobs = data.data;
+    if (
+      account.sourceFilter &&
+      Array.isArray(account.sourceFilter) &&
+      account.sourceFilter.length > 0
+    ) {
+      filteredJobs = data.data.filter((job) =>
+        account.sourceFilter.includes(job.JobSource)
+      );
+      console.log(
+        `🔍 Filtered jobs by sourceFilter: ${data.data.length} → ${filteredJobs.length} jobs`
+      );
+    } else {
+      console.log(
+        `⚠️ No sourceFilter configured, using all ${data.data.length} jobs`
+      );
+    }
+
+    // Add accountId to each job
+    const jobs = filteredJobs.map((job) => ({
+      ...job,
+      accountId: account._id,
+    }));
+
+    // Split jobs into batches
+    const batches = [];
+    for (let i = 0; i < jobs.length; i += batchSize) {
+      batches.push(jobs.slice(i, i + batchSize));
+    }
+
+    console.log(
+      `📦 Created ${batches.length} batches of ${batchSize} jobs each`
+    );
+
+    // Update session with batch info
+    if (sessionId) {
+      await db.collection("syncSessions").updateOne(
+        { sessionId, "accounts.accountId": accountId },
+        {
+          $set: {
+            "accounts.$.totalJobs": jobs.length,
+            "accounts.$.totalBatches": batches.length,
+            "accounts.$.batches": batches.map((batch, index) => ({
+              batchIndex: index,
+              jobCount: batch.length,
+              status: "pending",
+              uuids: batch.map((job) => job.UUID),
+            })),
+          },
+        }
+      );
+    }
+
+    // Process batches with rate limiting
+    let processedJobs = 0;
+    let updatedJobsCount = 0;
+    let failedUpdatesCount = 0;
+
+    for (let batchIndex = 0; batchIndex < batches.length; batchIndex++) {
+      const batch = batches[batchIndex];
+      const batchStartTime = Date.now();
+
+      console.log(
+        `🔄 Processing batch ${batchIndex + 1}/${batches.length} (${
+          batch.length
+        } jobs)`
+      );
+
+      // Update batch status
+      if (sessionId) {
+        await db.collection("syncSessions").updateOne(
+          {
+            sessionId,
+            "accounts.accountId": accountId,
+            "accounts.batches.batchIndex": batchIndex,
+          },
+          {
+            $set: {
+              "accounts.$.batches.$.status": "processing",
+              "accounts.$.batches.$.startTime": new Date(),
+            },
+          }
+        );
+      }
+
+      // Process each job in the batch with individual API calls
+      for (let jobIndex = 0; jobIndex < batch.length; jobIndex++) {
+        const job = batch[jobIndex];
+
+        try {
+          // Fetch detailed job data
+          const detailUrl = `https://api.workiz.com/api/v1/${account.workizToken}/job/get/${job.UUID}/`;
+
+          const detailResponse = await RetryHandler.withRetry(
+            () => APIManager.fetchWithTimeout(detailUrl, {}, 30000),
+            3,
+            2000,
+            workizCircuitBreaker
+          );
+
+          if (!detailResponse.ok) {
+            throw new Error(
+              `Workiz API error: ${detailResponse.status} ${detailResponse.statusText}`
+            );
+          }
+
+          const detailData = await detailResponse.json();
+
+          if (!detailData.flag || !detailData.data) {
+            throw new Error("Invalid response from Workiz API for job details");
+          }
+
+          const detailedJob = {
+            ...detailData.data,
+            accountId: account._id,
+            lastUpdated: new Date(),
+          };
+
+          // Update or insert job in database
+          const result = await db
+            .collection("jobs")
+            .updateOne(
+              { UUID: job.UUID, accountId: account._id },
+              { $set: detailedJob },
+              { upsert: true }
+            );
+
+          // Job processed successfully (logging removed for Vercel log limit)
+
+          updatedJobsCount++;
+          processedJobs++;
+
+          // Rate limiting: 2-second delay between API calls (30 calls per minute)
+          if (jobIndex < batch.length - 1) {
+            await new Promise((resolve) => setTimeout(resolve, delayMs));
+          }
+        } catch (error) {
+          // Job failed (logging removed for Vercel log limit)
+          failedUpdatesCount++;
+          processedJobs++;
+        }
+      }
+
+      const batchDuration = Date.now() - batchStartTime;
+      console.log(
+        `Batch ${batchIndex + 1}/${batches.length}: ${
+          batch.length
+        } jobs, ${updatedJobsCount} updated, ${failedUpdatesCount} failed`
+      );
+
+      // Update batch status
+      if (sessionId) {
+        await db.collection("syncSessions").updateOne(
+          {
+            sessionId,
+            "accounts.accountId": accountId,
+            "accounts.batches.batchIndex": batchIndex,
+          },
+          {
+            $set: {
+              "accounts.$.batches.$.status": "completed",
+              "accounts.$.batches.$.endTime": new Date(),
+              "accounts.$.batches.$.duration": batchDuration,
+              "accounts.$.batches.$.processedJobs": batch.length,
+              "accounts.$.batches.$.failedJobs":
+                batch.length - updatedJobsCount,
+            },
+          }
+        );
+      }
+
+      // Update overall progress
+      if (sessionId) {
+        await db.collection("syncSessions").updateOne(
+          { sessionId, "accounts.accountId": accountId },
+          {
+            $set: {
+              "accounts.$.processedJobs": processedJobs,
+              "accounts.$.progress": Math.round(
+                (processedJobs / jobs.length) * 100
+              ),
+            },
+          }
+        );
+      }
+    }
+
+    const accountDuration = Date.now() - accountStartTime;
+
+    // Update final account status
+    if (sessionId) {
+      await db.collection("syncSessions").updateOne(
+        { sessionId, "accounts.accountId": accountId },
+        {
+          $set: {
+            "accounts.$.status": "completed",
+            "accounts.$.endTime": new Date(),
+            "accounts.$.duration": accountDuration,
+            "accounts.$.processedJobs": processedJobs,
+            "accounts.$.updatedJobs": updatedJobsCount,
+            "accounts.$.failedJobs": failedUpdatesCount,
+          },
+        }
+      );
+    }
+
+    // Record sync history
+    const syncHistoryRecord = {
+      accountId: account._id,
+      syncType: "jobs",
+      status: "success",
+      timestamp: new Date(),
+      duration: accountDuration,
+      details: {
+        jobsFromWorkiz: data.data.length,
+        filteredJobs: jobs.length,
+        totalBatches: batches.length,
+        batchSize: batchSize,
+        jobsUpdated: updatedJobsCount,
+        failedUpdates: failedUpdatesCount,
+        syncMethod: "parallel",
+        sourceFilter: account.sourceFilter,
+        jobStatusBreakdown: {
+          submitted: jobs.filter((j) => j.Status === "Submitted").length,
+          pending: jobs.filter((j) => j.Status === "Pending").length,
+          completed: jobs.filter(
+            (j) =>
+              j.Status === "Completed" || j.Status === "done pending approval"
+          ).length,
+          cancelled: jobs.filter((j) =>
+            ["Cancelled", "Canceled", "Cancelled by Customer"].includes(
+              j.Status
+            )
+          ).length,
+        },
+      },
+    };
+
+    await db.collection("syncHistory").insertOne(syncHistoryRecord);
+
+    console.log(
+      `Account ${account.name} done: ${jobs.length} jobs, ${updatedJobsCount} updated, ${failedUpdatesCount} failed, ${accountDuration}ms`
+    );
+
+    res.json({
+      message: `Successfully processed account ${account.name}`,
+      accountId: account._id,
+      accountName: account.name,
+      duration: accountDuration,
+      details: {
+        jobsFromWorkiz: data.data.length,
+        filteredJobs: jobs.length,
+        totalBatches: batches.length,
+        jobsUpdated: updatedJobsCount,
+        failedUpdates: failedUpdatesCount,
+        sourceFilter: account.sourceFilter,
+      },
+    });
+  } catch (error) {
+    console.error(`❌ Error processing account ${accountId}:`, error);
+
+    // Update account status to failed
+    if (sessionId) {
+      await db.collection("syncSessions").updateOne(
+        { sessionId, "accounts.accountId": accountId },
+        {
+          $set: {
+            "accounts.$.status": "failed",
+            "accounts.$.error": error.message,
+            "accounts.$.endTime": new Date(),
+          },
+        }
+      );
+    }
+
+    res.status(500).json({
+      error: "Failed to process account",
+      accountId,
+      message: error.message,
+    });
+  }
+});
+
+// Get sync session status
+app.get("/api/sync/parallel/status/:sessionId", async (req, res) => {
+  const { sessionId } = req.params;
+
+  try {
+    await ensureDbConnection();
+
+    const session = await db.collection("syncSessions").findOne({ sessionId });
+
+    if (!session) {
+      return res.status(404).json({
+        error: "Sync session not found",
+        sessionId,
+      });
+    }
+
+    // Calculate overall progress
+    const totalAccounts = session.accounts.length;
+    const completedAccounts = session.accounts.filter(
+      (acc) => acc.status === "completed"
+    ).length;
+    const failedAccounts = session.accounts.filter(
+      (acc) => acc.status === "failed"
+    ).length;
+    const processingAccounts = session.accounts.filter(
+      (acc) => acc.status === "processing"
+    ).length;
+    const pendingAccounts = session.accounts.filter(
+      (acc) => acc.status === "pending"
+    ).length;
+
+    const overallProgress =
+      totalAccounts > 0
+        ? Math.round((completedAccounts / totalAccounts) * 100)
+        : 0;
+
+    // Determine overall status
+    let overallStatus = "processing";
+    if (completedAccounts === totalAccounts) {
+      overallStatus = "completed";
+    } else if (failedAccounts === totalAccounts) {
+      overallStatus = "failed";
+    } else if (completedAccounts + failedAccounts === totalAccounts) {
+      overallStatus = "completed_with_errors";
+    }
+
+    res.json({
+      sessionId: session.sessionId,
+      startTime: session.startTime,
+      overallStatus,
+      overallProgress,
+      totalAccounts,
+      completedAccounts,
+      failedAccounts,
+      processingAccounts,
+      pendingAccounts,
+      accounts: session.accounts.map((acc) => ({
+        accountId: acc.accountId,
+        accountName: acc.accountName,
+        status: acc.status,
+        progress: acc.progress || 0,
+        totalJobs: acc.totalJobs || 0,
+        processedJobs: acc.processedJobs || 0,
+        updatedJobs: acc.updatedJobs || 0,
+        failedJobs: acc.failedJobs || 0,
+        startTime: acc.startTime,
+        endTime: acc.endTime,
+        duration: acc.duration,
+        error: acc.error,
+      })),
+    });
+  } catch (error) {
+    console.error("❌ Error getting sync status:", error);
+    res.status(500).json({
+      error: "Failed to get sync status",
+      message: error.message,
+    });
+  }
+});
+
+// Get all sync sessions
+app.get("/api/sync/parallel/sessions", async (req, res) => {
+  try {
+    await ensureDbConnection();
+
+    const sessions = await db
+      .collection("syncSessions")
+      .find({})
+      .sort({ createdAt: -1 })
+      .limit(50)
+      .toArray();
+
+    res.json({
+      sessions: sessions.map((session) => ({
+        sessionId: session.sessionId,
+        startTime: session.startTime,
+        createdAt: session.createdAt,
+        totalAccounts: session.totalAccounts,
+        overallStatus: session.overallStatus,
+        accounts: session.accounts.map((acc) => ({
+          accountName: acc.accountName,
+          status: acc.status,
+          progress: acc.progress || 0,
+        })),
+      })),
+    });
+  } catch (error) {
+    console.error("❌ Error getting sync sessions:", error);
+    res.status(500).json({
+      error: "Failed to get sync sessions",
+      message: error.message,
+    });
+  }
+});
