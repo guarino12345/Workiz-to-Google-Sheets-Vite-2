@@ -31,10 +31,6 @@
     {
       "path": "/api/cron/sync-sheets",
       "schedule": "0 2 * * *"
-    },
-    {
-      "path": "/api/queue/process-all",
-      "schedule": "*/12 * * * *"
     }
   ],
   "env": {
