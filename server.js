@@ -83,7 +83,7 @@ class CircuitBreaker {
 }
 
 // Global circuit breaker instances
-const workizCircuitBreaker = new CircuitBreaker(5, 300000); // 5 failures, 5 minutes recovery
+const workizCircuitBreaker = new CircuitBreaker(3, 600000); // 3 failures, 10 minutes recovery
 const sheetsCircuitBreaker = new CircuitBreaker(3, 180000); // 3 failures, 3 minutes recovery
 
 // Enhanced error handling with retry logic
@@ -1672,8 +1672,8 @@ app.get("/api/cron/sync-jobs", async (req, res) => {
           accountId: account._id,
         }));
 
-        // Split jobs into batches (same as parallel sync)
-        const batchSize = 29;
+        // Split jobs into batches (reduced for better rate limiting)
+        const batchSize = 15;
         const batches = [];
         for (let i = 0; i < jobs.length; i += batchSize) {
           batches.push(jobs.slice(i, i + batchSize));
@@ -1744,6 +1744,15 @@ app.get("/api/cron/sync-jobs", async (req, res) => {
               );
 
               if (!detailResponse.ok) {
+                if (detailResponse.status === 429) {
+                  console.log(
+                    `⚠️ Rate limit hit for job ${job.UUID}, waiting 60 seconds...`
+                  );
+                  await new Promise((resolve) => setTimeout(resolve, 60000));
+                  throw new Error(
+                    `Rate limited: ${detailResponse.status} ${detailResponse.statusText}`
+                  );
+                }
                 throw new Error(
                   `Workiz API error: ${detailResponse.status} ${detailResponse.statusText}`
                 );
@@ -1775,9 +1784,9 @@ app.get("/api/cron/sync-jobs", async (req, res) => {
               updatedJobsCount++;
               processedJobs++;
 
-              // Rate limiting: 2-second delay between API calls (30 calls per minute)
+              // Rate limiting: 5-second delay between API calls (12 calls per minute)
               if (jobIndex < batch.length - 1) {
-                await new Promise((resolve) => setTimeout(resolve, 2000));
+                await new Promise((resolve) => setTimeout(resolve, 5000));
               }
             } catch (error) {
               failedUpdatesCount++;
@@ -1786,6 +1795,12 @@ app.get("/api/cron/sync-jobs", async (req, res) => {
           }
 
           const batchDuration = Date.now() - batchStartTime;
+
+          // Add delay between batches to prevent rate limiting
+          if (batchIndex < batches.length - 1) {
+            console.log(`⏳ Waiting 10 seconds before next batch...`);
+            await new Promise((resolve) => setTimeout(resolve, 10000));
+          }
 
           // Update batch status - using arrayFilters to avoid nested positional operators
           await db.collection("syncSessions").updateOne(
@@ -2823,6 +2838,15 @@ app.post("/api/sync/parallel/account/:accountId", async (req, res) => {
           );
 
           if (!detailResponse.ok) {
+            if (detailResponse.status === 429) {
+              console.log(
+                `⚠️ Rate limit hit for job ${job.UUID}, waiting 60 seconds...`
+              );
+              await new Promise((resolve) => setTimeout(resolve, 60000));
+              throw new Error(
+                `Rate limited: ${detailResponse.status} ${detailResponse.statusText}`
+              );
+            }
             throw new Error(
               `Workiz API error: ${detailResponse.status} ${detailResponse.statusText}`
             );
