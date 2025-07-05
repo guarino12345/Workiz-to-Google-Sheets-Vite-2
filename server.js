@@ -613,17 +613,17 @@ app.post("/api/sync-jobs/:accountId", async (req, res) => {
 
     console.log(`📋 Found ${existingJobs.length} existing jobs in database`);
 
-    // Calculate 1-year cutoff date
-    const oneYearAgo = new Date();
-    oneYearAgo.setDate(oneYearAgo.getDate() - 365);
+    // Calculate 32-day cutoff date (standardized with cron job)
+    const cutoffDate = new Date();
+    cutoffDate.setDate(cutoffDate.getDate() - 32);
 
     let updatedJobsCount = 0;
     let deletedJobsCount = 0;
     let failedUpdatesCount = 0;
 
-    // Process jobs in batches to avoid memory issues and rate limiting
-    const BATCH_SIZE = 29;
-    const DELAY_BETWEEN_BATCHES = 60000; // 60 seconds in milliseconds
+    // Process jobs in batches (standardized with cron job)
+    const BATCH_SIZE = 15;
+    const DELAY_BETWEEN_BATCHES = 10000; // 10 seconds between batches
 
     for (let i = 0; i < existingJobs.length; i += BATCH_SIZE) {
       const batch = existingJobs.slice(i, i + BATCH_SIZE);
@@ -637,8 +637,8 @@ app.post("/api/sync-jobs/:accountId", async (req, res) => {
         try {
           const jobDate = new Date(existingJob.JobDateTime);
 
-          // Check if job is older than 1 year
-          if (jobDate < oneYearAgo) {
+          // Check if job is older than 32 days
+          if (jobDate < cutoffDate) {
             console.log(
               `🗑️ Deleting old job: ${existingJob.UUID} (${existingJob.JobDateTime})`
             );
@@ -663,9 +663,17 @@ app.post("/api/sync-jobs/:accountId", async (req, res) => {
 
               if (!resp.ok) {
                 const errorText = await resp.text();
-                console.log(
-                  `❌ Job update error: ${resp.status} - ${errorText}`
-                );
+
+                // Handle 429 rate limiting specifically
+                if (resp.status === 429) {
+                  console.log(
+                    `⚠️ Rate limit hit for job ${existingJob.UUID}, waiting 60 seconds...`
+                  );
+                  await new Promise((resolve) => setTimeout(resolve, 60000));
+                  throw new Error(
+                    `Rate limited: ${resp.status} ${resp.statusText}`
+                  );
+                }
 
                 // Check if response is HTML (520 error page)
                 if (
@@ -673,9 +681,6 @@ app.post("/api/sync-jobs/:accountId", async (req, res) => {
                   errorText.includes("Oops!") ||
                   errorText.includes("Something went wrong")
                 ) {
-                  console.log(
-                    `🚨 Detected HTML error page from Workiz API (likely 520 error)`
-                  );
                   throw new Error(
                     `Workiz API 520 error - server is experiencing issues`
                   );
@@ -730,8 +735,8 @@ app.post("/api/sync-jobs/:accountId", async (req, res) => {
             failedUpdatesCount++;
           }
 
-          // Add a small delay between individual job updates (100ms)
-          await new Promise((resolve) => setTimeout(resolve, 100));
+          // Rate limiting: 5-second delay between API calls (12 calls per minute)
+          await new Promise((resolve) => setTimeout(resolve, 5000));
         } catch (error) {
           console.log(
             `❌ Error processing job ${existingJob.UUID}: ${error.message}`
@@ -769,7 +774,7 @@ app.post("/api/sync-jobs/:accountId", async (req, res) => {
         jobsUpdated: updatedJobsCount,
         jobsDeleted: deletedJobsCount,
         failedUpdates: failedUpdatesCount,
-        syncMethod: "manual",
+        syncMethod: "manual_standardized",
         sourceFilter: account.sourceFilter,
         jobStatusBreakdown: {
           submitted: jobs.filter((j) => j.Status === "Submitted").length,
