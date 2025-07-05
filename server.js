@@ -445,7 +445,6 @@ app.post("/api/sync-jobs/:accountId", async (req, res) => {
   try {
     const db = await ensureDbConnection();
     const { accountId } = req.params;
-    console.log(`🔍 Starting sync for account ID: ${accountId}`);
 
     // Find account by ID - try both id and _id fields
     const account = await db.collection("accounts").findOne({
@@ -453,15 +452,8 @@ app.post("/api/sync-jobs/:accountId", async (req, res) => {
     });
 
     if (!account) {
-      console.log(`❌ Account not found for ID: ${accountId}`);
       return res.status(404).json({ error: "Account not found" });
     }
-
-    console.log(
-      `✅ Found account: ${account.name} (API Token: ${
-        account.workizApiToken ? "Present" : "Missing"
-      })`
-    );
 
     if (!account.workizApiToken) {
       return res
@@ -471,7 +463,6 @@ app.post("/api/sync-jobs/:accountId", async (req, res) => {
 
     // Fetch jobs from Workiz API using the token from the account
     const workizUrl = `https://api.workiz.com/api/v1/${account.workizApiToken}/job/all/?start_date=2025-01-01&offset=0&records=100&only_open=false`;
-    console.log(`🌐 Fetching from Workiz: ${workizUrl}`);
 
     const response = await RetryHandler.withRetry(
       async () => {
@@ -506,20 +497,12 @@ app.post("/api/sync-jobs/:accountId", async (req, res) => {
     ); // 5 retries, 2s base delay, with circuit breaker
 
     const data = await response.json();
-    console.log(
-      `📊 Workiz API response: flag=${data.flag}, data.length=${
-        data.data?.length || 0
-      }`
-    );
 
     if (!data.flag || !Array.isArray(data.data)) {
-      console.log(`❌ Invalid Workiz API response structure`);
       return res
         .status(500)
         .json({ error: "Invalid response from Workiz API" });
     }
-
-    // Processing jobs from Workiz (logging simplified for Vercel)
 
     // Filter jobs by sourceFilter if configured
     let filteredJobs = data.data;
@@ -531,17 +514,9 @@ app.post("/api/sync-jobs/:accountId", async (req, res) => {
       filteredJobs = data.data.filter((job) =>
         account.sourceFilter.includes(job.JobSource)
       );
-      console.log(
-        `🔍 Filtered jobs by sourceFilter: ${data.data.length} → ${filteredJobs.length} jobs`
-      );
-    } else {
-      console.log(
-        `⚠️ No sourceFilter configured, using all ${data.data.length} jobs`
-      );
     }
 
     if (filteredJobs.length === 0) {
-      console.log(`⚠️ No jobs match the sourceFilter criteria`);
       return res.json({
         message: `No jobs match the sourceFilter criteria for account ${
           account.name || "Unknown"
@@ -560,20 +535,10 @@ app.post("/api/sync-jobs/:accountId", async (req, res) => {
       accountId: account._id || account.id,
     }));
 
-    console.log(
-      `🏷️ Added accountId to filtered jobs. Sample job UUIDs: ${jobs
-        .slice(0, 3)
-        .map((j) => j.UUID)
-        .join(", ")}`
-    );
-
     // Check for existing jobs with same UUIDs
     const existingJobCount = await db.collection("jobs").countDocuments({
       UUID: { $in: jobs.map((job) => job.UUID) },
     });
-    console.log(
-      `🔍 Found ${existingJobCount} existing jobs with matching UUIDs`
-    );
 
     // Upsert jobs into MongoDB
     const bulkOps = jobs.map((job) => ({
@@ -584,34 +549,15 @@ app.post("/api/sync-jobs/:accountId", async (req, res) => {
       },
     }));
 
-    console.log(`💾 Executing bulk write with ${bulkOps.length} operations`);
-
     if (bulkOps.length > 0) {
       const bulkResult = await db.collection("jobs").bulkWrite(bulkOps);
-      console.log(`✅ Bulk write completed:`, {
-        matchedCount: bulkResult.matchedCount,
-        modifiedCount: bulkResult.modifiedCount,
-        upsertedCount: bulkResult.upsertedCount,
-        insertedCount: bulkResult.insertedCount,
-      });
     }
-
-    // Verify final count
-    const finalJobCount = await db.collection("jobs").countDocuments({
-      accountId: account._id || account.id,
-    });
-    console.log(`📈 Final job count for account: ${finalJobCount}`);
-
-    // Update existing jobs and clean up old ones
-    console.log(`🔄 Starting job update and cleanup process...`);
 
     // Get all existing jobs for this account
     const existingJobs = await db
       .collection("jobs")
       .find({ accountId: account._id || account.id })
       .toArray();
-
-    console.log(`📋 Found ${existingJobs.length} existing jobs in database`);
 
     // Calculate 32-day cutoff date (standardized with cron job)
     const cutoffDate = new Date();
@@ -630,8 +576,6 @@ app.post("/api/sync-jobs/:accountId", async (req, res) => {
       const batchNumber = Math.floor(i / BATCH_SIZE) + 1;
       const totalBatches = Math.ceil(existingJobs.length / BATCH_SIZE);
 
-      console.log(`Batch ${batchNumber}/${totalBatches}: ${batch.length} jobs`);
-
       // Process each job in the current batch
       for (const existingJob of batch) {
         try {
@@ -639,9 +583,6 @@ app.post("/api/sync-jobs/:accountId", async (req, res) => {
 
           // Check if job is older than 32 days
           if (jobDate < cutoffDate) {
-            console.log(
-              `🗑️ Deleting old job: ${existingJob.UUID} (${existingJob.JobDateTime})`
-            );
             await RetryHandler.withRetry(async () => {
               await db.collection("jobs").deleteOne({ UUID: existingJob.UUID });
             });
@@ -715,11 +656,7 @@ app.post("/api/sync-jobs/:accountId", async (req, res) => {
               });
 
               updatedJobsCount++;
-              console.log(`✅ Updated job: ${existingJob.UUID}`);
             } else {
-              console.log(
-                `⚠️ Job not found in Workiz API: ${existingJob.UUID}`
-              );
               // Job might have been deleted in Workiz, so delete from our database
               await RetryHandler.withRetry(async () => {
                 await db
@@ -729,25 +666,18 @@ app.post("/api/sync-jobs/:accountId", async (req, res) => {
               deletedJobsCount++;
             }
           } else {
-            console.log(
-              `❌ Failed to update job ${existingJob.UUID}: ${updateResponse.status}`
-            );
             failedUpdatesCount++;
           }
 
           // Rate limiting: 5-second delay between API calls (12 calls per minute)
           await new Promise((resolve) => setTimeout(resolve, 5000));
         } catch (error) {
-          console.log(
-            `❌ Error processing job ${existingJob.UUID}: ${error.message}`
-          );
           failedUpdatesCount++;
         }
       }
 
       // Add delay between batches (except for the last batch)
       if (i + BATCH_SIZE < existingJobs.length) {
-        console.log(`⏳ Waiting 60 seconds before next batch...`);
         await new Promise((resolve) =>
           setTimeout(resolve, DELAY_BETWEEN_BATCHES)
         );
@@ -1525,13 +1455,10 @@ app.get("/api/cron/sync-jobs", async (req, res) => {
     });
 
     if (accounts.length === 0) {
-      console.log("📭 No accounts found to sync");
       return res.json({
         message: "No accounts found to sync",
       });
     }
-
-    console.log(`📋 Found ${accounts.length} accounts for processing`);
 
     // Create sync session for tracking (same as parallel sync)
     const syncSession = {
@@ -1560,7 +1487,6 @@ app.get("/api/cron/sync-jobs", async (req, res) => {
     // Process all accounts in parallel using the same logic as manual parallel sync
     const accountPromises = accounts.map(async (account) => {
       const accountStartTime = Date.now();
-      console.log(`Processing account: ${account.name}`);
 
       try {
         // Update session status
@@ -1613,9 +1539,6 @@ app.get("/api/cron/sync-jobs", async (req, res) => {
           filteredRecentJobs = data.data.filter((job) =>
             account.sourceFilter.includes(job.JobSource)
           );
-          console.log(
-            `Recent jobs filtered: ${data.data.length} → ${filteredRecentJobs.length} jobs`
-          );
         }
 
         // Step 2: Get all existing jobs from database for this account
@@ -1638,13 +1561,7 @@ app.get("/api/cron/sync-jobs", async (req, res) => {
           }
         });
 
-        console.log(
-          `${account.name}: ${allJobsToUpdate.length} jobs to update (${
-            filteredRecentJobs.length
-          } recent + ${
-            allJobsToUpdate.length - filteredRecentJobs.length
-          } existing)`
-        );
+        // Jobs to update calculated (logging removed for Vercel limit)
 
         // Add accountId to each job
         const jobs = allJobsToUpdate.map((job) => ({
@@ -1778,7 +1695,6 @@ app.get("/api/cron/sync-jobs", async (req, res) => {
 
           // Add delay between batches to prevent rate limiting
           if (batchIndex < batches.length - 1) {
-            console.log(`⏳ Waiting 10 seconds before next batch...`);
             await new Promise((resolve) => setTimeout(resolve, 10000));
           }
 
@@ -1891,9 +1807,7 @@ app.get("/api/cron/sync-jobs", async (req, res) => {
 
         await db.collection("syncHistory").insertOne(syncHistoryRecord);
 
-        console.log(
-          `${account.name}: ${jobs.length} jobs processed, ${updatedJobsCount} updated, ${failedUpdatesCount} failed, ${deleteResult.deletedCount} deleted (${accountDuration}ms)`
-        );
+        // Account processing completed (logging removed for Vercel limit)
 
         return {
           account: account.name,
@@ -1968,9 +1882,7 @@ app.get("/api/cron/sync-jobs", async (req, res) => {
       }
     );
 
-    console.log(
-      `🎯 Cron sync completed: ${successfulSyncs} successful, ${failedSyncs} failed (${totalDuration}ms)`
-    );
+    // Cron sync completed (logging removed for Vercel limit)
 
     res.json({
       message: `Cron parallel sync completed: ${successfulSyncs} successful, ${failedSyncs} failed`,
@@ -2575,10 +2487,7 @@ export default app;
 // Initialize parallel sync for all accounts
 app.post("/api/sync/parallel/init", async (req, res) => {
   const startTime = Date.now();
-  console.log(
-    "🕐 Parallel sync initialization triggered at:",
-    new Date().toISOString()
-  );
+  // Parallel sync initialization (logging removed for Vercel limit)
 
   try {
     await ensureDbConnection();
@@ -2593,7 +2502,7 @@ app.post("/api/sync/parallel/init", async (req, res) => {
       });
     }
 
-    console.log(`📋 Found ${accounts.length} accounts for processing`);
+    // Accounts found (logging removed for Vercel limit)
 
     // Create sync session for tracking
     const syncSession = {
@@ -2661,7 +2570,7 @@ app.post("/api/sync/parallel/account/:accountId", async (req, res) => {
       });
     }
 
-    console.log(`Processing account: ${account.name}`);
+    // Processing account (logging removed for Vercel limit)
 
     // Update session status
     if (sessionId) {
