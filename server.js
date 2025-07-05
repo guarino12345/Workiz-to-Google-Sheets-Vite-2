@@ -1213,9 +1213,11 @@ app.post("/api/sync-to-sheets/:accountId", async (req, res) => {
 
 // Manual trigger endpoint for testing cron functionality
 app.post("/api/trigger-sync/:accountId", async (req, res) => {
+  const accountStartTime = Date.now();
+
   try {
     const { accountId } = req.params;
-    console.log(`🔧 Manual sync trigger for account ID: ${accountId}`);
+    console.log(`🕐 Manual sync triggered at: ${new Date().toISOString()}`);
 
     // Find account
     const account = await db.collection("accounts").findOne({
@@ -1226,7 +1228,7 @@ app.post("/api/trigger-sync/:accountId", async (req, res) => {
       return res.status(404).json({ error: "Account not found" });
     }
 
-    console.log(`⏰ Manual sync for account: ${account.name}`);
+    console.log(`📋 Processing account: ${account.name}`);
 
     // Sync jobs
     try {
@@ -1264,9 +1266,6 @@ app.post("/api/trigger-sync/:accountId", async (req, res) => {
         );
       }
 
-      // Update existing jobs and clean up old ones
-      console.log(`🔄 Starting job update and cleanup process...`);
-
       // Get all existing jobs for this account
       const existingJobs = await db
         .collection("jobs")
@@ -1292,9 +1291,7 @@ app.post("/api/trigger-sync/:accountId", async (req, res) => {
         const batchNumber = Math.floor(i / BATCH_SIZE) + 1;
         const totalBatches = Math.ceil(existingJobs.length / BATCH_SIZE);
 
-        console.log(
-          `📦 Processing batch ${batchNumber}/${totalBatches} (${batch.length} jobs)`
-        );
+        // Batch processing (logging removed for cleaner output)
 
         // Process each job in the current batch
         for (const existingJob of batch) {
@@ -1303,9 +1300,6 @@ app.post("/api/trigger-sync/:accountId", async (req, res) => {
 
             // Check if job is older than 1 year
             if (jobDate < oneYearAgo) {
-              console.log(
-                `🗑️ Deleting old job: ${existingJob.UUID} (${existingJob.JobDateTime})`
-              );
               await RetryHandler.withRetry(async () => {
                 await db
                   .collection("jobs")
@@ -1316,7 +1310,6 @@ app.post("/api/trigger-sync/:accountId", async (req, res) => {
             }
 
             // Update job using Workiz API
-            console.log(`🔄 Updating job: ${existingJob.UUID}`);
             const updateUrl = `https://api.workiz.com/api/v1/${account.workizApiToken}/job/get/${existingJob.UUID}/`;
 
             const updateResponse = await RetryHandler.withRetry(
@@ -1329,9 +1322,6 @@ app.post("/api/trigger-sync/:accountId", async (req, res) => {
 
                 if (!resp.ok) {
                   const errorText = await resp.text();
-                  console.log(
-                    `❌ Job update error: ${resp.status} - ${errorText}`
-                  );
 
                   // Check if response is HTML (520 error page)
                   if (
@@ -1339,9 +1329,6 @@ app.post("/api/trigger-sync/:accountId", async (req, res) => {
                     errorText.includes("Oops!") ||
                     errorText.includes("Something went wrong")
                   ) {
-                    console.log(
-                      `🚨 Detected HTML error page from Workiz API (likely 520 error)`
-                    );
                     throw new Error(
                       `Workiz API 520 error - server is experiencing issues`
                     );
@@ -1379,11 +1366,7 @@ app.post("/api/trigger-sync/:accountId", async (req, res) => {
                 });
 
                 updatedJobsCount++;
-                console.log(`✅ Updated job: ${existingJob.UUID}`);
               } else {
-                console.log(
-                  `⚠️ Job not found in Workiz API: ${existingJob.UUID}`
-                );
                 // Job might have been deleted in Workiz, so delete from our database
                 await RetryHandler.withRetry(async () => {
                   await db
@@ -1393,35 +1376,28 @@ app.post("/api/trigger-sync/:accountId", async (req, res) => {
                 deletedJobsCount++;
               }
             } else {
-              console.log(
-                `❌ Failed to update job ${existingJob.UUID}: ${updateResponse.status}`
-              );
               failedUpdatesCount++;
             }
 
             // Add a small delay between individual job updates (100ms)
             await new Promise((resolve) => setTimeout(resolve, 100));
           } catch (error) {
-            console.log(
-              `❌ Error processing job ${existingJob.UUID}: ${error.message}`
-            );
             failedUpdatesCount++;
           }
         }
 
         // Add delay between batches (except for the last batch)
         if (i + BATCH_SIZE < existingJobs.length) {
-          console.log(`⏳ Waiting 60 seconds before next batch...`);
           await new Promise((resolve) =>
             setTimeout(resolve, DELAY_BETWEEN_BATCHES)
           );
         }
       }
 
-      console.log(`📊 Job update and cleanup completed:`);
-      console.log(`   - Updated: ${updatedJobsCount} jobs`);
-      console.log(`   - Deleted (old): ${deletedJobsCount} jobs`);
-      console.log(`   - Failed updates: ${failedUpdatesCount} jobs`);
+      const accountDuration = Date.now() - accountStartTime;
+      console.log(
+        `${account.name}: ${existingJobs.length} jobs processed, ${updatedJobsCount} updated, ${failedUpdatesCount} failed, ${deletedJobsCount} deleted (${accountDuration}ms)`
+      );
 
       // Record sync history
       const syncHistoryRecord = {
@@ -1482,8 +1458,7 @@ app.post("/api/trigger-sync/:accountId", async (req, res) => {
       });
     } catch (error) {
       console.error(
-        `❌ Manual sync failed for account ${account.name}:`,
-        error.message
+        `❌ Manual sync failed for account ${account.name}: ${error.message}`
       );
 
       // Record failed sync history
@@ -2595,7 +2570,10 @@ export default app;
 // Initialize parallel sync for all accounts
 app.post("/api/sync/parallel/init", async (req, res) => {
   const startTime = Date.now();
-  console.log("🚀 Starting parallel account sync initialization...");
+  console.log(
+    "🕐 Parallel sync initialization triggered at:",
+    new Date().toISOString()
+  );
 
   try {
     await ensureDbConnection();
@@ -2610,7 +2588,7 @@ app.post("/api/sync/parallel/init", async (req, res) => {
       });
     }
 
-    console.log(`📊 Found ${accounts.length} accounts for parallel processing`);
+    console.log(`📋 Found ${accounts.length} accounts for processing`);
 
     // Create sync session for tracking
     const syncSession = {
@@ -2634,8 +2612,6 @@ app.post("/api/sync/parallel/init", async (req, res) => {
 
     // Store sync session
     await db.collection("syncSessions").insertOne(syncSession);
-
-    console.log(`📋 Created sync session: ${syncSession.sessionId}`);
 
     // Return session info for client to start processing
     res.json({
@@ -2664,7 +2640,6 @@ app.post("/api/sync/parallel/account/:accountId", async (req, res) => {
   const { sessionId, batchSize = 29, delayMs = 2000 } = req.body;
 
   const accountStartTime = Date.now();
-  console.log(`🔄 Starting account processing: ${accountId}`);
 
   try {
     await ensureDbConnection();
@@ -2681,7 +2656,7 @@ app.post("/api/sync/parallel/account/:accountId", async (req, res) => {
       });
     }
 
-    console.log(`📋 Processing account: ${account.name}`);
+    console.log(`Processing account: ${account.name}`);
 
     // Update session status
     if (sessionId) {
@@ -2703,8 +2678,6 @@ app.post("/api/sync/parallel/account/:accountId", async (req, res) => {
 
     const workizUrl = `https://api.workiz.com/api/v1/${account.workizToken}/job/all/?start_date=${formattedStartDate}&offset=0&records=100&only_open=true`;
 
-    console.log(`🌐 Fetching jobs from Workiz for ${account.name}...`);
-
     const response = await RetryHandler.withRetry(
       () => APIManager.fetchWithTimeout(workizUrl, {}, 30000),
       3,
@@ -2724,13 +2697,6 @@ app.post("/api/sync/parallel/account/:accountId", async (req, res) => {
       throw new Error("Invalid response from Workiz API");
     }
 
-    console.log(
-      `📋 Processing ${data.data.length} jobs from Workiz for ${account.name}`
-    );
-    console.log(
-      `📋 Account sourceFilter: ${JSON.stringify(account.sourceFilter)}`
-    );
-
     // Filter jobs by sourceFilter if configured
     let filteredJobs = data.data;
     if (
@@ -2742,11 +2708,7 @@ app.post("/api/sync/parallel/account/:accountId", async (req, res) => {
         account.sourceFilter.includes(job.JobSource)
       );
       console.log(
-        `🔍 Filtered jobs by sourceFilter: ${data.data.length} → ${filteredJobs.length} jobs`
-      );
-    } else {
-      console.log(
-        `⚠️ No sourceFilter configured, using all ${data.data.length} jobs`
+        `Recent jobs filtered: ${data.data.length} → ${filteredJobs.length} jobs`
       );
     }
 
@@ -2762,9 +2724,7 @@ app.post("/api/sync/parallel/account/:accountId", async (req, res) => {
       batches.push(jobs.slice(i, i + batchSize));
     }
 
-    console.log(
-      `📦 Created ${batches.length} batches of ${batchSize} jobs each`
-    );
+    // Batches created (logging removed for cleaner output)
 
     // Update session with batch info
     if (sessionId) {
