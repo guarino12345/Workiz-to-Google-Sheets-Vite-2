@@ -3448,6 +3448,7 @@ app.post("/api/update-account-jobs/:accountId", async (req, res) => {
     let deletedJobsCount = 0;
     let failedUpdatesCount = 0;
     const errors = [];
+    let currentIndex = 0; // Track current processing index
 
     // Calculate time budget (11 minutes to be safe)
     const TIME_BUDGET = 11 * 60 * 1000; // 11 minutes
@@ -3463,6 +3464,7 @@ app.post("/api/update-account-jobs/:accountId", async (req, res) => {
         console.log(
           `⏰ Time budget exceeded for account ${account.name}, stopping at job ${lastProcessedIndex} (UUID: ${lastProcessedJob})`
         );
+        currentIndex = i; // Set current index before breaking
         break;
       }
 
@@ -3475,6 +3477,7 @@ app.post("/api/update-account-jobs/:accountId", async (req, res) => {
       );
 
       for (const existingJob of batch) {
+        currentIndex = i + batch.indexOf(existingJob); // Update current index
         try {
           // Update job using Workiz API
           const updateUrl = `https://api.workiz.com/api/v1/${account.workizApiToken}/job/get/${existingJob.UUID}/`;
@@ -3572,6 +3575,7 @@ app.post("/api/update-account-jobs/:accountId", async (req, res) => {
           setTimeout(resolve, DELAY_BETWEEN_BATCHES)
         );
       }
+      currentIndex = i + BATCH_SIZE; // Update current index at end of loop
     }
 
     const accountDuration = Date.now() - accountStartTime;
@@ -3606,7 +3610,8 @@ app.post("/api/update-account-jobs/:accountId", async (req, res) => {
       startIndex + updatedJobsCount + deletedJobsCount + failedUpdatesCount;
     const remainingJobs = existingJobs.length - totalJobsProcessed;
     const lastProcessedJob =
-      jobsToProcess[Math.min(i, jobsToProcess.length - 1)]?.UUID || null;
+      jobsToProcess[Math.min(currentIndex, jobsToProcess.length - 1)]?.UUID ||
+      null;
 
     const response = {
       account: account.name,
