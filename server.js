@@ -3390,8 +3390,37 @@ app.post("/api/update-account-jobs/:accountId", async (req, res) => {
       .find({ accountId: account._id })
       .toArray();
 
-    if (existingJobs.length === 0) {
-      console.log(`⚠️ No jobs found for account: ${account.name}`);
+    // Check if this is a resume operation
+    const isResume = req.body && req.body.resumeFrom;
+    let startIndex = 0;
+
+    if (isResume && req.body.resumeFrom) {
+      console.log(`🔄 Resuming from job UUID: ${req.body.resumeFrom}`);
+
+      // Find the index of the job to resume from
+      const resumeIndex = existingJobs.findIndex(
+        (job) => job.UUID === req.body.resumeFrom
+      );
+      if (resumeIndex !== -1) {
+        startIndex = resumeIndex;
+        console.log(
+          `📍 Resuming from index ${startIndex} (job ${startIndex + 1} of ${
+            existingJobs.length
+          })`
+        );
+      } else {
+        console.log(
+          `⚠️ Resume job ${req.body.resumeFrom} not found, starting from beginning`
+        );
+        startIndex = 0;
+      }
+    }
+
+    // Get jobs starting from the resume point
+    const jobsToProcess = existingJobs.slice(startIndex);
+
+    if (jobsToProcess.length === 0) {
+      console.log(`⚠️ No jobs to process for account: ${account.name}`);
       return res.json({
         account: account.name,
         success: true,
@@ -3399,11 +3428,17 @@ app.post("/api/update-account-jobs/:accountId", async (req, res) => {
         jobsUpdated: 0,
         jobsDeleted: 0,
         duration: Date.now() - accountStartTime,
+        resumeInfo: {
+          isResume: isResume,
+          totalJobs: existingJobs.length,
+          processedJobs: startIndex,
+          remainingJobs: 0,
+        },
       });
     }
 
     console.log(
-      `📊 Found ${existingJobs.length} jobs to update for ${account.name}`
+      `📊 Processing ${jobsToProcess.length} jobs (${startIndex} already processed) for ${account.name}`
     );
 
     // Process jobs with rate limiting
@@ -3418,18 +3453,22 @@ app.post("/api/update-account-jobs/:accountId", async (req, res) => {
     const TIME_BUDGET = 11 * 60 * 1000; // 11 minutes
     const startTime = Date.now();
 
-    for (let i = 0; i < existingJobs.length; i += BATCH_SIZE) {
+    for (let i = 0; i < jobsToProcess.length; i += BATCH_SIZE) {
       // Check if we're running out of time
       if (Date.now() - startTime > TIME_BUDGET) {
+        const lastProcessedIndex = startIndex + i;
+        const lastProcessedJob = jobsToProcess[i]
+          ? jobsToProcess[i].UUID
+          : null;
         console.log(
-          `⏰ Time budget exceeded for account ${account.name}, stopping at job ${i}`
+          `⏰ Time budget exceeded for account ${account.name}, stopping at job ${lastProcessedIndex} (UUID: ${lastProcessedJob})`
         );
         break;
       }
 
-      const batch = existingJobs.slice(i, i + BATCH_SIZE);
+      const batch = jobsToProcess.slice(i, i + BATCH_SIZE);
       const batchNumber = Math.floor(i / BATCH_SIZE) + 1;
-      const totalBatches = Math.ceil(existingJobs.length / BATCH_SIZE);
+      const totalBatches = Math.ceil(jobsToProcess.length / BATCH_SIZE);
 
       console.log(
         `📦 Processing batch ${batchNumber}/${totalBatches} (${batch.length} jobs) for ${account.name}`
@@ -3528,7 +3567,7 @@ app.post("/api/update-account-jobs/:accountId", async (req, res) => {
       }
 
       // Add delay between batches (except for the last batch)
-      if (i + BATCH_SIZE < existingJobs.length) {
+      if (i + BATCH_SIZE < jobsToProcess.length) {
         await new Promise((resolve) =>
           setTimeout(resolve, DELAY_BETWEEN_BATCHES)
         );
@@ -3562,15 +3601,30 @@ app.post("/api/update-account-jobs/:accountId", async (req, res) => {
       await db.collection("syncHistory").insertOne(syncHistoryRecord);
     });
 
+    // Calculate resume information
+    const totalJobsProcessed =
+      startIndex + updatedJobsCount + deletedJobsCount + failedUpdatesCount;
+    const remainingJobs = existingJobs.length - totalJobsProcessed;
+    const lastProcessedJob =
+      jobsToProcess[Math.min(i, jobsToProcess.length - 1)]?.UUID || null;
+
     const response = {
       account: account.name,
       success: true,
-      jobsProcessed: existingJobs.length,
+      jobsProcessed: jobsToProcess.length,
       jobsUpdated: updatedJobsCount,
       jobsDeleted: deletedJobsCount,
       failedUpdates: failedUpdatesCount,
       errors: errors,
       duration: accountDuration,
+      resumeInfo: {
+        isResume: isResume,
+        totalJobs: existingJobs.length,
+        processedJobs: totalJobsProcessed,
+        remainingJobs: remainingJobs,
+        lastProcessedJob: lastProcessedJob,
+        canResume: remainingJobs > 0 && lastProcessedJob,
+      },
     };
 
     console.log(`📤 Sending response for ${account.name}:`, response);
@@ -3591,6 +3645,81 @@ app.post("/api/update-account-jobs/:accountId", async (req, res) => {
 
     console.log(`📤 Sending error response for ${accountId}:`, errorResponse);
     res.status(500).json(errorResponse);
+  }
+});
+
+// Resume update for a specific account
+app.post("/api/resume-account-update/:accountId", async (req, res) => {
+  const accountStartTime = Date.now();
+  const { accountId } = req.params;
+  const { resumeFrom } = req.body;
+
+  try {
+    console.log(
+      `🔄 Starting resume update for account ID: ${accountId} from job: ${resumeFrom}`
+    );
+
+    await ensureDbConnection();
+
+    // Find account by ID
+    const account = await db.collection("accounts").findOne({
+      $or: [{ _id: new ObjectId(accountId) }, { id: accountId }],
+    });
+
+    if (!account) {
+      throw new Error("Account not found");
+    }
+
+    if (!account.workizApiToken) {
+      throw new Error("Missing API token for this account");
+    }
+
+    if (!resumeFrom) {
+      throw new Error("Missing resumeFrom parameter");
+    }
+
+    // Call the worker function with resume parameter
+    const workerResponse = await APIManager.fetchWithTimeout(
+      `${req.protocol}://${req.get(
+        "host"
+      )}/api/update-account-jobs/${accountId}`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ resumeFrom }),
+      },
+      12 * 60 * 1000 // 12 minutes timeout
+    );
+
+    const workerResult = await workerResponse.json();
+
+    if (!workerResponse.ok) {
+      throw new Error(workerResult.error || "Worker function failed");
+    }
+
+    const duration = Date.now() - accountStartTime;
+    console.log(
+      `✅ Resume update completed for ${account.name} in ${duration}ms`
+    );
+
+    res.json({
+      account: account.name,
+      success: true,
+      ...workerResult,
+      duration: duration,
+    });
+  } catch (error) {
+    const duration = Date.now() - accountStartTime;
+    console.error(`❌ Resume update error after ${duration}ms:`, error);
+
+    res.status(500).json({
+      account: accountId,
+      success: false,
+      error: error.message,
+      duration: duration,
+    });
   }
 });
 
