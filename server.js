@@ -3151,18 +3151,26 @@ app.post("/api/update-all-jobs-parallel", async (req, res) => {
             { $set: { "accounts.$.status": "running" } }
           );
 
-        // Call the account-specific worker function
-        const workerResponse = await fetch(
-          `${req.protocol}://${req.get("host")}/api/update-account-jobs/${
-            account._id
-          }`,
-          {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-              "X-Operation-ID": operationId,
-            },
-          }
+        // Call the account-specific worker function with extended timeout and retry
+        const workerResponse = await RetryHandler.withRetry(
+          async () => {
+            return await APIManager.fetchWithTimeout(
+              `${req.protocol}://${req.get("host")}/api/update-account-jobs/${
+                account._id
+              }`,
+              {
+                method: "POST",
+                headers: {
+                  "Content-Type": "application/json",
+                  "X-Operation-ID": operationId,
+                },
+              },
+              12 * 60 * 1000 // 12 minutes timeout for worker functions
+            );
+          },
+          2, // 2 retries
+          5000, // 5 second delay between retries
+          null // No circuit breaker for internal calls
         );
 
         const workerResult = await workerResponse.json();
@@ -3193,7 +3201,9 @@ app.post("/api/update-all-jobs-parallel", async (req, res) => {
         console.log(
           `✅ Account ${account.name} ${status}: ${
             workerResult.jobsUpdated || 0
-          } updated, ${workerResult.jobsDeleted || 0} deleted`
+          } updated, ${workerResult.jobsDeleted || 0} deleted, ${
+            workerResult.failedUpdates || 0
+          } failed`
         );
 
         return {
@@ -3203,6 +3213,68 @@ app.post("/api/update-all-jobs-parallel", async (req, res) => {
         };
       } catch (error) {
         console.error(`❌ Error processing account ${account.name}:`, error);
+
+        // Check if it's a timeout error
+        const isTimeoutError =
+          error.message.includes("timeout") ||
+          error.message.includes("HeadersTimeoutError") ||
+          error.cause?.code === "UND_ERR_HEADERS_TIMEOUT";
+
+        // If it's a timeout, check if the worker actually completed by looking at the database
+        if (isTimeoutError) {
+          try {
+            // Check if the worker completed by looking for sync history
+            const syncHistory = await db.collection("syncHistory").findOne({
+              accountId: account._id,
+              syncType: "jobs_uuid_update",
+              "details.operationId": operationId,
+              timestamp: { $gte: new Date(Date.now() - 5 * 60 * 1000) }, // Last 5 minutes
+            });
+
+            if (syncHistory) {
+              console.log(
+                `✅ Account ${account.name} actually completed despite timeout`
+              );
+
+              // Update account status to completed
+              await db.collection("parallelOperations").updateOne(
+                { operationId, "accounts.accountId": account._id },
+                {
+                  $set: {
+                    "accounts.$.status": "completed",
+                    "accounts.$.jobsProcessed":
+                      syncHistory.details.totalJobs || 0,
+                    "accounts.$.jobsUpdated":
+                      syncHistory.details.jobsUpdated || 0,
+                    "accounts.$.jobsDeleted":
+                      syncHistory.details.jobsDeleted || 0,
+                    "accounts.$.errors": [],
+                  },
+                }
+              );
+
+              // Update completed count
+              await db
+                .collection("parallelOperations")
+                .updateOne({ operationId }, { $inc: { completedAccounts: 1 } });
+
+              return {
+                account: account.name,
+                success: true,
+                jobsProcessed: syncHistory.details.totalJobs || 0,
+                jobsUpdated: syncHistory.details.jobsUpdated || 0,
+                jobsDeleted: syncHistory.details.jobsDeleted || 0,
+                failedUpdates: syncHistory.details.failedUpdates || 0,
+                duration: syncHistory.duration || 0,
+              };
+            }
+          } catch (dbError) {
+            console.log(
+              `⚠️ Could not verify completion for ${account.name}:`,
+              dbError.message
+            );
+          }
+        }
 
         // Update account status to failed
         await db.collection("parallelOperations").updateOne(
@@ -3232,8 +3304,8 @@ app.post("/api/update-all-jobs-parallel", async (req, res) => {
     const timeoutPromise = new Promise((_, reject) => {
       setTimeout(
         () => reject(new Error("Parallel processing timeout")),
-        11 * 60 * 1000
-      ); // 11 minutes
+        13 * 60 * 1000
+      ); // 13 minutes to give workers more time
     });
 
     const results = await Promise.race([
@@ -3490,7 +3562,7 @@ app.post("/api/update-account-jobs/:accountId", async (req, res) => {
       await db.collection("syncHistory").insertOne(syncHistoryRecord);
     });
 
-    res.json({
+    const response = {
       account: account.name,
       success: true,
       jobsProcessed: existingJobs.length,
@@ -3499,7 +3571,10 @@ app.post("/api/update-account-jobs/:accountId", async (req, res) => {
       failedUpdates: failedUpdatesCount,
       errors: errors,
       duration: accountDuration,
-    });
+    };
+
+    console.log(`📤 Sending response for ${account.name}:`, response);
+    res.json(response);
   } catch (error) {
     const duration = Date.now() - accountStartTime;
     console.log(
@@ -3507,12 +3582,15 @@ app.post("/api/update-account-jobs/:accountId", async (req, res) => {
     );
     console.error("Full error:", error);
 
-    res.status(500).json({
+    const errorResponse = {
       account: accountId,
       success: false,
       error: error.message,
       duration: duration,
-    });
+    };
+
+    console.log(`📤 Sending error response for ${accountId}:`, errorResponse);
+    res.status(500).json(errorResponse);
   }
 });
 

@@ -445,10 +445,10 @@ const JobList: React.FC<JobListProps> = ({ accounts }) => {
       ? account.sourceFilter.join(', ')
       : 'All sources';
     
-    const googleSheetsUrl = account.googleSheetsId
+    const googleSheetsUrl = account.googleSheetsId 
       ? `https://docs.google.com/spreadsheets/d/${account.googleSheetsId}/edit`
       : null;
-
+    
     return (
       <Box sx={{ mb: 2, p: 2, border: '1px solid #e0e0e0', borderRadius: 1 }}>
         <Typography variant="h6" gutterBottom>
