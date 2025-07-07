@@ -575,6 +575,11 @@ app.post("/api/sync-jobs/:accountId", async (req, res) => {
       `📊 Cleanup completed: ${deleteResult.deletedCount} old jobs deleted`
     );
 
+    // Get final job count after sync and cleanup
+    const finalJobCount = await db
+      .collection("jobs")
+      .countDocuments({ accountId: account._id || account.id });
+
     // Record sync history
     const syncHistoryRecord = {
       accountId: account._id || account.id,
