@@ -3,8 +3,6 @@ import { Box, Paper, Typography, Tabs, Tab } from '@mui/material';
 import AccountForm from './AccountForm';
 import AccountList from './AccountList';
 import JobList from './JobList';
-import ParallelSync from './ParallelSync';
-import SyncHistory from './SyncHistory';
 import { Account } from '../types/index';
 import { buildApiUrl } from '../utils/api';
 
@@ -60,8 +58,6 @@ const Dashboard: React.FC = () => {
       
       <Tabs value={activeTab} onChange={handleTabChange} sx={{ mb: 3 }}>
         <Tab label="Account Management" />
-        <Tab label="Parallel Sync" />
-        <Tab label="Sync History" />
       </Tabs>
 
       {activeTab === 0 && (
@@ -103,36 +99,6 @@ const Dashboard: React.FC = () => {
               <JobList accounts={accounts} />
             </Paper>
           </Box>
-        </Box>
-      )}
-
-      {activeTab === 1 && (
-        <ParallelSync />
-      )}
-
-      {activeTab === 2 && (
-        <Box sx={{ display: 'flex', flexDirection: 'column', gap: 3 }}>
-          <Paper sx={{ p: 2 }}>
-            <Typography variant="h6" gutterBottom>
-              Sync History
-            </Typography>
-            {accounts.length > 0 ? (
-              <Box sx={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
-                {accounts.map((account) => (
-                  <Box key={account.id} sx={{ border: '1px solid #e0e0e0', borderRadius: 1, p: 2 }}>
-                    <Typography variant="subtitle1" gutterBottom>
-                      {account.name}
-                    </Typography>
-                    <SyncHistory accountId={account.id} />
-                  </Box>
-                ))}
-              </Box>
-            ) : (
-              <Typography variant="body2" color="text.secondary">
-                No accounts found. Please create an account first.
-              </Typography>
-            )}
-          </Paper>
         </Box>
       )}
     </Box>
