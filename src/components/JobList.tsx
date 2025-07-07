@@ -24,11 +24,11 @@ import {
   ExpandLess,
   CloudDownload,
   CloudUpload,
-  Refresh
+  Refresh,
+  Update
 } from '@mui/icons-material';
 import { Account } from '../types/index';
 import { buildApiUrl } from '../utils/api';
-import SyncHistoryComponent from './SyncHistory';
 
 interface Job {
   UUID: string;
@@ -88,8 +88,7 @@ const JobList: React.FC<JobListProps> = ({ accounts }) => {
   const [error, setError] = useState<string>('');
   const [syncing, setSyncing] = useState(false);
   const [syncingToSheets, setSyncingToSheets] = useState(false);
-  const [refreshSyncHistory, setRefreshSyncHistory] = useState(0);
-  const [manualTriggering, setManualTriggering] = useState(false);
+  const [updatingJobs, setUpdatingJobs] = useState(false);
   
   // New state for enhanced loading and progress
   const [syncProgress, setSyncProgress] = useState<SyncProgress | null>(null);
@@ -122,7 +121,7 @@ const JobList: React.FC<JobListProps> = ({ accounts }) => {
       }
     };
     fetchAllJobs();
-  }, [accounts, syncing]);
+  }, [accounts, syncing, updatingJobs]);
 
   const handleAccountChange = (accountId: string) => {
     if (!accountId) {
@@ -149,7 +148,8 @@ const JobList: React.FC<JobListProps> = ({ accounts }) => {
     });
   };
 
-  const handleSync = async () => {
+  // Sync Latest Jobs - fetches new jobs from Workiz
+  const handleSyncLatestJobs = async () => {
     if (!selectedAccount?.id) {
       console.error('No account ID available for sync');
       return;
@@ -164,13 +164,13 @@ const JobList: React.FC<JobListProps> = ({ accounts }) => {
     updateSyncProgress('fetching', 0, 'Initializing sync...');
     
     try {
-      console.log('Syncing jobs for account:', selectedAccount.id);
+      console.log('Syncing latest jobs for account:', selectedAccount.id);
       
       // Simulate progress updates for better UX
       updateSyncProgress('fetching', 10, 'Connecting to Workiz API...');
       await new Promise<void>(resolve => setTimeout(resolve, 500));
       
-      updateSyncProgress('fetching', 25, 'Fetching jobs from Workiz...');
+      updateSyncProgress('fetching', 25, 'Fetching latest jobs from Workiz...');
       await new Promise<void>(resolve => setTimeout(resolve, 500));
       
       updateSyncProgress('processing', 40, 'Processing job data...');
@@ -186,7 +186,7 @@ const JobList: React.FC<JobListProps> = ({ accounts }) => {
       
       if (!response.ok) {
         const errorData = await response.json() as { error?: string };
-        const errorMessage = errorData.error || 'Failed to sync jobs';
+        const errorMessage = errorData.error || 'Failed to sync latest jobs';
         setError(errorMessage);
         setSyncResult({
           success: false,
@@ -198,36 +198,20 @@ const JobList: React.FC<JobListProps> = ({ accounts }) => {
       
       const result = await response.json() as { details?: any };
       
-      updateSyncProgress('cleaning', 90, 'Cleaning up old data...');
+      updateSyncProgress('complete', 100, 'Sync completed successfully!');
       await new Promise<void>(resolve => setTimeout(resolve, 500));
       
-      updateSyncProgress('complete', 100, 'Sync completed successfully!');
-      await new Promise<void>(resolve => setTimeout(resolve, 1000));
-      
-      // Set success result
       setSyncResult({
         success: true,
-        message: `Successfully synced ${result.details?.jobsFromWorkiz || 0} jobs`,
+        message: `Successfully synced latest jobs`,
         details: result.details,
         timestamp: new Date()
       });
       
-      // After successful sync, refresh sync history
-      setRefreshSyncHistory(prev => prev + 1);
-      
-      // Reload jobs by triggering the useEffect
-      const jobsResponse = await fetch(buildApiUrl('/api/jobs'));
-      if (jobsResponse.ok) {
-        const jobsData = await jobsResponse.json();
-        setAllJobs(jobsData);
-      }
-      
-    } catch (err: unknown) {
+      console.log('Sync successful:', result);
+    } catch (err) {
       console.error('Sync error:', err);
-      const errorMessage = getErrorMessage(err);
-      setError(errorMessage);
-      
-      // Set error result
+      setError(getErrorMessage(err));
       setSyncResult({
         success: false,
         message: 'Sync failed',
@@ -235,31 +219,119 @@ const JobList: React.FC<JobListProps> = ({ accounts }) => {
       });
     } finally {
       setSyncing(false);
-      // Keep progress visible for a moment, then clear
-      setTimeout(() => setSyncProgress(null), 3000);
+      setSyncProgress(null);
     }
   };
 
+  // Update All Jobs - updates existing jobs by UUID
+  const handleUpdateAllJobs = async () => {
+    if (!selectedAccount?.id) {
+      console.error('No account ID available for update');
+      return;
+    }
+    
+    setUpdatingJobs(true);
+    setError('');
+    setSyncResult(null);
+    setShowSyncDetails(false);
+    
+    // Initialize progress
+    updateSyncProgress('fetching', 0, 'Initializing job updates...');
+    
+    try {
+      console.log('Updating all jobs for account:', selectedAccount.id);
+      
+      // Simulate progress updates for better UX
+      updateSyncProgress('fetching', 10, 'Connecting to Workiz API...');
+      await new Promise<void>(resolve => setTimeout(resolve, 500));
+      
+      updateSyncProgress('fetching', 25, 'Fetching existing jobs...');
+      await new Promise<void>(resolve => setTimeout(resolve, 500));
+      
+      updateSyncProgress('processing', 40, 'Processing job updates...');
+      await new Promise<void>(resolve => setTimeout(resolve, 500));
+      
+      // Call the UUID update endpoint manually
+      const response = await fetch(
+        buildApiUrl(`/api/cron/update-jobs-uuid`),
+        { 
+          method: 'GET',
+          headers: {
+            'User-Agent': 'Vercel-Cron-Job'
+          }
+        }
+      );
+      
+      updateSyncProgress('updating', 70, 'Updating jobs in database...');
+      await new Promise<void>(resolve => setTimeout(resolve, 500));
+      
+      if (!response.ok) {
+        const errorData = await response.json() as { error?: string };
+        const errorMessage = errorData.error || 'Failed to update jobs';
+        setError(errorMessage);
+        setSyncResult({
+          success: false,
+          message: 'Update failed',
+          timestamp: new Date()
+        });
+        return;
+      }
+      
+      const result = await response.json() as { details?: any };
+      
+      updateSyncProgress('complete', 100, 'Job updates completed successfully!');
+      await new Promise<void>(resolve => setTimeout(resolve, 500));
+      
+      setSyncResult({
+        success: true,
+        message: `Successfully updated all jobs`,
+        details: result.details,
+        timestamp: new Date()
+      });
+      
+      console.log('Update successful:', result);
+    } catch (err) {
+      console.error('Update error:', err);
+      setError(getErrorMessage(err));
+      setSyncResult({
+        success: false,
+        message: 'Update failed',
+        timestamp: new Date()
+      });
+    } finally {
+      setUpdatingJobs(false);
+      setSyncProgress(null);
+    }
+  };
+
+  // Sync to Google Sheets
   const handleSyncToSheets = async () => {
-    if (!selectedAccount?.id) return;
+    if (!selectedAccount?.id) {
+      console.error('No account ID available for Google Sheets sync');
+      return;
+    }
+    
     setSyncingToSheets(true);
     setError('');
     setSyncResult(null);
     setShowSyncDetails(false);
     
+    // Initialize progress
+    updateSyncProgress('fetching', 20, 'Preparing Google Sheets sync...');
+    
     try {
-      updateSyncProgress('fetching', 20, 'Preparing Google Sheets sync...');
-      await new Promise<void>(resolve => setTimeout(resolve, 300));
+      console.log('Syncing to Google Sheets for account:', selectedAccount.id);
       
       updateSyncProgress('processing', 50, 'Syncing to Google Sheets...');
+      await new Promise<void>(resolve => setTimeout(resolve, 500));
       
       const response = await fetch(
         buildApiUrl(`/api/sync-to-sheets/${selectedAccount.id}`),
         { method: 'POST' }
       );
-      const data = await response.json() as { error?: string; details?: any };
       
       if (!response.ok) {
+        const data = await response.json() as { error?: string };
         const errorMessage = data.error || 'Failed to sync to Google Sheets';
         setError(errorMessage);
         setSyncResult({
@@ -270,8 +342,10 @@ const JobList: React.FC<JobListProps> = ({ accounts }) => {
         return;
       }
       
+      const data = await response.json();
+      
       updateSyncProgress('complete', 100, 'Google Sheets sync completed!');
-      await new Promise<void>(resolve => setTimeout(resolve, 1000));
+      await new Promise<void>(resolve => setTimeout(resolve, 500));
       
       setSyncResult({
         success: true,
@@ -281,12 +355,9 @@ const JobList: React.FC<JobListProps> = ({ accounts }) => {
       });
       
       console.log('Sync to sheets successful:', data);
-      setRefreshSyncHistory(prev => prev + 1); // Trigger sync history refresh
-    } catch (err: unknown) {
+    } catch (err) {
       console.error('Sync to sheets error:', err);
-      const errorMessage = getErrorMessage(err);
-      setError(errorMessage);
-      
+      setError(getErrorMessage(err));
       setSyncResult({
         success: false,
         message: 'Google Sheets sync failed',
@@ -294,81 +365,15 @@ const JobList: React.FC<JobListProps> = ({ accounts }) => {
       });
     } finally {
       setSyncingToSheets(false);
-      setTimeout(() => setSyncProgress(null), 3000);
-    }
-  };
-
-  const handleManualTrigger = async () => {
-    if (!selectedAccount?.id) return;
-    setManualTriggering(true);
-    setError('');
-    setSyncResult(null);
-    setShowSyncDetails(false);
-    
-    try {
-      updateSyncProgress('fetching', 30, 'Triggering manual sync...');
-      await new Promise<void>(resolve => setTimeout(resolve, 300));
-      
-      updateSyncProgress('processing', 60, 'Processing manual sync...');
-      
-      const response = await fetch(
-        buildApiUrl(`/api/trigger-sync/${selectedAccount.id}`),
-        { method: 'POST' }
-      );
-      const data = await response.json() as { error?: string; jobsSync?: { details?: any } };
-      
-      if (!response.ok) {
-        const errorMessage = data.error || 'Failed to trigger manual sync';
-        setError(errorMessage);
-        setSyncResult({
-          success: false,
-          message: 'Manual sync failed',
-          timestamp: new Date()
-        });
-        return;
-      }
-      
-      updateSyncProgress('complete', 100, 'Manual sync completed!');
-      await new Promise<void>(resolve => setTimeout(resolve, 1000));
-      
-      setSyncResult({
-        success: true,
-        message: `Manual sync completed successfully`,
-        details: data.jobsSync?.details,
-        timestamp: new Date()
-      });
-      
-      console.log('Manual trigger successful:', data);
-      setRefreshSyncHistory(prev => prev + 1); // Trigger sync history refresh
-      
-      // Reload jobs
-      const jobsResponse = await fetch(buildApiUrl('/api/jobs'));
-      if (jobsResponse.ok) {
-        const jobsData = await jobsResponse.json();
-        setAllJobs(jobsData);
-      }
-      
-    } catch (err: unknown) {
-      console.error('Manual trigger error:', err);
-      const errorMessage = getErrorMessage(err);
-      setError(errorMessage);
-      
-      setSyncResult({
-        success: false,
-        message: 'Manual sync failed',
-        timestamp: new Date()
-      });
-    } finally {
-      setManualTriggering(false);
-      setTimeout(() => setSyncProgress(null), 3000);
+      setSyncProgress(null);
     }
   };
 
   const getProgressColor = (phase: SyncProgress['phase']) => {
     switch (phase) {
-      case 'fetching': return 'primary';
-      case 'processing': return 'info';
-      case 'updating': return 'warning';
+      case 'fetching': return 'info';
+      case 'processing': return 'warning';
+      case 'updating': return 'primary';
       case 'cleaning': return 'secondary';
       case 'complete': return 'success';
       default: return 'primary';
@@ -377,26 +382,26 @@ const JobList: React.FC<JobListProps> = ({ accounts }) => {
 
   const getProgressIcon = (phase: SyncProgress['phase']) => {
     switch (phase) {
-      case 'fetching': return <CloudDownload />;
-      case 'processing': return <Refresh />;
-      case 'updating': return <CloudUpload />;
-      case 'cleaning': return <Refresh />;
-      case 'complete': return <CheckCircle />;
-      default: return <CloudDownload />;
+      case 'fetching': return <CloudDownload color="info" />;
+      case 'processing': return <Refresh color="warning" />;
+      case 'updating': return <Update color="primary" />;
+      case 'cleaning': return <Refresh color="secondary" />;
+      case 'complete': return <CheckCircle color="success" />;
+      default: return <Refresh color="primary" />;
     }
   };
 
   const renderAccountInfo = (account: Account) => {
-    const sourceFilterText = Array.isArray(account.sourceFilter) && account.sourceFilter.length > 0
+    const sourceFilterText = account.sourceFilter && account.sourceFilter.length > 0
       ? account.sourceFilter.join(', ')
       : 'All sources';
     
-    const googleSheetsUrl = account.googleSheetsId 
+    const googleSheetsUrl = account.googleSheetsId
       ? `https://docs.google.com/spreadsheets/d/${account.googleSheetsId}/edit`
       : null;
-    
+
     return (
-      <Box sx={{ mb: 2 }}>
+      <Box sx={{ mb: 2, p: 2, border: '1px solid #e0e0e0', borderRadius: 1 }}>
         <Typography variant="h6" gutterBottom>
           {account.name || 'Unnamed Account'}
         </Typography>
@@ -582,37 +587,41 @@ const JobList: React.FC<JobListProps> = ({ accounts }) => {
             </Card>
           )}
 
-          <Box sx={{ display: 'flex', gap: 2, mb: 2 }}>
+          {/* Three Main Action Buttons */}
+          <Box sx={{ display: 'flex', gap: 2, mb: 2, flexWrap: 'wrap' }}>
             <Button
               variant="contained"
               color="primary"
-              onClick={handleSync}
-              disabled={syncing}
+              onClick={handleSyncLatestJobs}
+              disabled={syncing || updatingJobs || syncingToSheets}
               startIcon={syncing ? <Refresh /> : <CloudDownload />}
+              sx={{ minWidth: '150px' }}
             >
-              {syncing ? 'Syncing...' : 'Sync Jobs'}
+              {syncing ? 'Syncing...' : 'Sync Latest Jobs'}
             </Button>
             <Button
               variant="contained"
               color="secondary"
-              onClick={handleSyncToSheets}
-              disabled={syncingToSheets || !selectedAccount.googleSheetsId}
-              startIcon={syncingToSheets ? <Refresh /> : <CloudUpload />}
+              onClick={handleUpdateAllJobs}
+              disabled={syncing || updatingJobs || syncingToSheets}
+              startIcon={updatingJobs ? <Refresh /> : <Update />}
+              sx={{ minWidth: '150px' }}
             >
-              {syncingToSheets ? 'Syncing to Sheets...' : 'Sync to Google Sheets'}
+              {updatingJobs ? 'Updating...' : 'Update All Jobs'}
             </Button>
-            {selectedAccount.syncEnabled && (
-              <Button
-                variant="outlined"
-                color="info"
-                onClick={handleManualTrigger}
-                disabled={manualTriggering}
-                startIcon={manualTriggering ? <Refresh /> : <Refresh />}
-              >
-                {manualTriggering ? 'Triggering...' : 'Manual Sync'}
-              </Button>
-            )}
+            <Button
+              variant="contained"
+              color="success"
+              onClick={handleSyncToSheets}
+              disabled={syncing || updatingJobs || syncingToSheets || !selectedAccount.googleSheetsId}
+              startIcon={syncingToSheets ? <Refresh /> : <CloudUpload />}
+              sx={{ minWidth: '150px' }}
+            >
+              {syncingToSheets ? 'Syncing...' : 'Sync to Google Sheets'}
+            </Button>
           </Box>
+
+          {/* Warnings and Info */}
           {!selectedAccount.workizApiToken && (
             <Alert severity="warning">
               Please add a Workiz API token to the selected account to sync jobs.
@@ -629,14 +638,6 @@ const JobList: React.FC<JobListProps> = ({ accounts }) => {
             Use the manual sync buttons above for immediate updates.
           </Alert>
           {error && <Alert severity="error">{error}</Alert>}
-          
-          {/* Sync History Section */}
-          {selectedAccount.id && (
-            <SyncHistoryComponent 
-              accountId={selectedAccount.id} 
-              refreshTrigger={refreshSyncHistory}
-            />
-          )}
         </>
       )}
     </Box>
