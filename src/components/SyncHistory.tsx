@@ -111,7 +111,7 @@ const SyncHistoryComponent: React.FC<SyncHistoryProps> = ({ accountId, refreshTr
   };
 
   const getSyncMethodLabel = (syncMethod: string) => {
-    return syncMethod === 'manual' ? 'Manual' : 'Cron';
+    return syncMethod === 'manual' || syncMethod === 'manual_standardized' ? 'Manual' : 'Cron';
   };
 
   const renderSyncDetails = (sync: SyncHistory) => {
