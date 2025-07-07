@@ -63,6 +63,9 @@ interface SyncResult {
     jobsUpdated?: number;
     jobsDeleted?: number;
     failedUpdates?: number;
+    successfulAccounts?: number;
+    totalAccounts?: number;
+    operationId?: string;
   };
   timestamp: Date;
 }
@@ -89,6 +92,8 @@ const JobList: React.FC<JobListProps> = ({ accounts }) => {
   const [syncing, setSyncing] = useState(false);
   const [syncingToSheets, setSyncingToSheets] = useState(false);
   const [updatingJobs, setUpdatingJobs] = useState(false);
+  const [currentOperationId, setCurrentOperationId] = useState<string | null>(null);
+  const [operationProgress, setOperationProgress] = useState<any>(null);
   
   // New state for enhanced loading and progress
   const [syncProgress, setSyncProgress] = useState<SyncProgress | null>(null);
@@ -122,6 +127,31 @@ const JobList: React.FC<JobListProps> = ({ accounts }) => {
     };
     fetchAllJobs();
   }, [accounts, syncing, updatingJobs]);
+
+  // Poll operation progress when operation is running
+  useEffect(() => {
+    if (!currentOperationId) return;
+
+    const pollInterval = setInterval(async () => {
+      try {
+        const response = await fetch(buildApiUrl(`/api/parallel-operation/${currentOperationId}`));
+        if (response.ok) {
+          const operation = await response.json();
+          setOperationProgress(operation);
+          
+          // Stop polling if operation is complete
+          if (operation.status === 'completed' || operation.status === 'completed_with_errors') {
+            setCurrentOperationId(null);
+            clearInterval(pollInterval);
+          }
+        }
+      } catch (error) {
+        console.error('Error polling operation status:', error);
+      }
+    }, 2000); // Poll every 2 seconds
+
+    return () => clearInterval(pollInterval);
+  }, [currentOperationId]);
 
   const handleAccountChange = (accountId: string) => {
     if (!accountId) {
@@ -223,7 +253,7 @@ const JobList: React.FC<JobListProps> = ({ accounts }) => {
     }
   };
 
-  // Update All Jobs - updates existing jobs by UUID
+  // Update All Jobs - updates existing jobs by UUID using parallel processing
   const handleUpdateAllJobs = async () => {
     if (!selectedAccount?.id) {
       console.error('No account ID available for update');
@@ -236,28 +266,28 @@ const JobList: React.FC<JobListProps> = ({ accounts }) => {
     setShowSyncDetails(false);
     
     // Initialize progress
-    updateSyncProgress('fetching', 0, 'Initializing job updates...');
+    updateSyncProgress('fetching', 0, 'Initializing parallel job updates...');
     
     try {
-      console.log('Updating all jobs for account:', selectedAccount.id);
+      console.log('Starting parallel job updates for all accounts');
       
       // Simulate progress updates for better UX
-      updateSyncProgress('fetching', 10, 'Connecting to Workiz API...');
+      updateSyncProgress('fetching', 10, 'Preparing parallel processing...');
       await new Promise<void>(resolve => setTimeout(resolve, 500));
       
-      updateSyncProgress('fetching', 25, 'Fetching existing jobs...');
+      updateSyncProgress('fetching', 25, 'Starting parallel workers...');
       await new Promise<void>(resolve => setTimeout(resolve, 500));
       
-      updateSyncProgress('processing', 40, 'Processing job updates...');
+      updateSyncProgress('processing', 40, 'Processing jobs in parallel...');
       await new Promise<void>(resolve => setTimeout(resolve, 500));
       
-      // Call the UUID update endpoint manually
+      // Call the parallel processing endpoint
       const response = await fetch(
-        buildApiUrl(`/api/cron/update-jobs-uuid`),
+        buildApiUrl(`/api/update-all-jobs-parallel`),
         { 
-          method: 'GET',
+          method: 'POST',
           headers: {
-            'User-Agent': 'Vercel-Cron-Job'
+            'Content-Type': 'application/json'
           }
         }
       );
@@ -277,19 +307,38 @@ const JobList: React.FC<JobListProps> = ({ accounts }) => {
         return;
       }
       
-      const result = await response.json() as { details?: any };
+      const result = await response.json() as { operationId?: string; details?: any; results?: any[] };
       
-      updateSyncProgress('complete', 100, 'Job updates completed successfully!');
+      // Set operation ID for real-time progress tracking
+      if (result.operationId) {
+        setCurrentOperationId(result.operationId);
+      }
+      
+      updateSyncProgress('complete', 100, 'Parallel job updates completed successfully!');
       await new Promise<void>(resolve => setTimeout(resolve, 500));
+      
+      // Calculate summary from results
+      const totalJobsUpdated = result.results?.reduce((sum, r) => sum + (r.jobsUpdated || 0), 0) || 0;
+      const totalJobsDeleted = result.results?.reduce((sum, r) => sum + (r.jobsDeleted || 0), 0) || 0;
+      const totalFailed = result.results?.reduce((sum, r) => sum + (r.failedUpdates || 0), 0) || 0;
+      const successfulAccounts = result.results?.filter(r => r.success).length || 0;
+      const totalAccounts = result.results?.length || 0;
       
       setSyncResult({
         success: true,
-        message: `Successfully updated all jobs`,
-        details: result.details,
+        message: `Successfully updated jobs across ${successfulAccounts}/${totalAccounts} accounts`,
+        details: {
+          jobsUpdated: totalJobsUpdated,
+          jobsDeleted: totalJobsDeleted,
+          failedUpdates: totalFailed,
+          successfulAccounts,
+          totalAccounts,
+          operationId: result.operationId
+        },
         timestamp: new Date()
       });
       
-      console.log('Update successful:', result);
+      console.log('Parallel update successful:', result);
     } catch (err) {
       console.error('Update error:', err);
       setError(getErrorMessage(err));
@@ -510,6 +559,56 @@ const JobList: React.FC<JobListProps> = ({ accounts }) => {
             </Card>
           )}
 
+          {/* Real-time Operation Progress */}
+          {operationProgress && (
+            <Card sx={{ mb: 2, border: '1px solid', borderColor: 'primary.main' }}>
+              <CardContent>
+                <Typography variant="h6" gutterBottom>
+                  Parallel Operation Progress
+                </Typography>
+                <Box sx={{ mb: 2 }}>
+                  <Typography variant="body2" color="text.secondary">
+                    Status: {operationProgress.status}
+                  </Typography>
+                  <Typography variant="body2" color="text.secondary">
+                    Accounts: {operationProgress.completedAccounts}/{operationProgress.totalAccounts} completed
+                  </Typography>
+                  {operationProgress.duration && (
+                    <Typography variant="body2" color="text.secondary">
+                      Duration: {Math.round(operationProgress.duration / 1000)}s
+                    </Typography>
+                  )}
+                </Box>
+                
+                {/* Account-specific progress */}
+                {operationProgress.accounts && (
+                  <Box sx={{ mt: 2 }}>
+                    <Typography variant="subtitle2" gutterBottom>
+                      Account Progress:
+                    </Typography>
+                    {operationProgress.accounts.map((account: any, index: number) => (
+                      <Box key={index} sx={{ mb: 1, p: 1, border: '1px solid #e0e0e0', borderRadius: 1 }}>
+                        <Typography variant="body2" sx={{ fontWeight: 'bold' }}>
+                          {account.accountName}
+                        </Typography>
+                        <Typography variant="body2" color="text.secondary">
+                          Status: {account.status} | 
+                          Updated: {account.jobsUpdated} | 
+                          Deleted: {account.jobsDeleted}
+                        </Typography>
+                        {account.errors && account.errors.length > 0 && (
+                          <Typography variant="body2" color="error" sx={{ fontSize: '0.75rem' }}>
+                            Errors: {account.errors.length}
+                          </Typography>
+                        )}
+                      </Box>
+                    ))}
+                  </Box>
+                )}
+              </CardContent>
+            </Card>
+          )}
+
           {/* Sync Result */}
           {syncResult && (
             <Card sx={{ 
@@ -607,7 +706,7 @@ const JobList: React.FC<JobListProps> = ({ accounts }) => {
               startIcon={updatingJobs ? <Refresh /> : <Update />}
               sx={{ minWidth: '150px' }}
             >
-              {updatingJobs ? 'Updating...' : 'Update All Jobs'}
+              {updatingJobs ? 'Updating...' : 'Update All Jobs (Parallel)'}
             </Button>
             <Button
               variant="contained"
@@ -635,7 +734,8 @@ const JobList: React.FC<JobListProps> = ({ accounts }) => {
           <Alert severity="info" sx={{ mb: 2 }}>
             <AlertTitle>Automated Sync</AlertTitle>
             Jobs are automatically synced daily at 9:00 AM UTC via Vercel Cron Jobs. 
-            Use the manual sync buttons above for immediate updates.
+            Use the manual sync buttons above for immediate updates. The "Update All Jobs (Parallel)" 
+            button processes all accounts simultaneously for faster completion.
           </Alert>
           {error && <Alert severity="error">{error}</Alert>}
         </>

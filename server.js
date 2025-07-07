@@ -3091,3 +3091,448 @@ app.get("/api/cron/update-jobs-uuid", async (req, res) => {
     });
   }
 });
+
+// Master function for parallel account processing
+app.post("/api/update-all-jobs-parallel", async (req, res) => {
+  const startTime = Date.now();
+
+  try {
+    console.log(
+      `🚀 Starting parallel job update for all accounts at ${new Date().toISOString()}`
+    );
+
+    await ensureDbConnection();
+
+    // Get all active accounts
+    const accounts = await db.collection("accounts").find({}).toArray();
+
+    if (accounts.length === 0) {
+      console.log(`⚠️ No accounts found for parallel update`);
+      return res.json({
+        message: "No accounts to update",
+        timestamp: new Date().toISOString(),
+      });
+    }
+
+    console.log(`📋 Found ${accounts.length} accounts for parallel processing`);
+
+    // Create operation tracking record
+    const operationId = new ObjectId().toString();
+    const operationRecord = {
+      operationId,
+      status: "running",
+      totalAccounts: accounts.length,
+      completedAccounts: 0,
+      failedAccounts: 0,
+      startTime: new Date(),
+      accounts: accounts.map((account) => ({
+        accountId: account._id,
+        accountName: account.name,
+        status: "pending",
+        jobsProcessed: 0,
+        jobsUpdated: 0,
+        jobsDeleted: 0,
+        errors: [],
+      })),
+    };
+
+    await db.collection("parallelOperations").insertOne(operationRecord);
+
+    // Start parallel processing for each account
+    const accountPromises = accounts.map(async (account) => {
+      try {
+        console.log(`🔄 Starting parallel update for account: ${account.name}`);
+
+        // Update account status to running
+        await db
+          .collection("parallelOperations")
+          .updateOne(
+            { operationId, "accounts.accountId": account._id },
+            { $set: { "accounts.$.status": "running" } }
+          );
+
+        // Call the account-specific worker function
+        const workerResponse = await fetch(
+          `${req.protocol}://${req.get("host")}/api/update-account-jobs/${
+            account._id
+          }`,
+          {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "X-Operation-ID": operationId,
+            },
+          }
+        );
+
+        const workerResult = await workerResponse.json();
+
+        // Update account status based on result
+        const status = workerResponse.ok ? "completed" : "failed";
+        await db.collection("parallelOperations").updateOne(
+          { operationId, "accounts.accountId": account._id },
+          {
+            $set: {
+              "accounts.$.status": status,
+              "accounts.$.jobsProcessed": workerResult.jobsProcessed || 0,
+              "accounts.$.jobsUpdated": workerResult.jobsUpdated || 0,
+              "accounts.$.jobsDeleted": workerResult.jobsDeleted || 0,
+              "accounts.$.errors": workerResult.errors || [],
+            },
+          }
+        );
+
+        // Update overall completion count
+        const updateField = workerResponse.ok
+          ? "completedAccounts"
+          : "failedAccounts";
+        await db
+          .collection("parallelOperations")
+          .updateOne({ operationId }, { $inc: { [updateField]: 1 } });
+
+        console.log(
+          `✅ Account ${account.name} ${status}: ${
+            workerResult.jobsUpdated || 0
+          } updated, ${workerResult.jobsDeleted || 0} deleted`
+        );
+
+        return {
+          account: account.name,
+          success: workerResponse.ok,
+          ...workerResult,
+        };
+      } catch (error) {
+        console.error(`❌ Error processing account ${account.name}:`, error);
+
+        // Update account status to failed
+        await db.collection("parallelOperations").updateOne(
+          { operationId, "accounts.accountId": account._id },
+          {
+            $set: {
+              "accounts.$.status": "failed",
+              "accounts.$.errors": [error.message],
+            },
+          }
+        );
+
+        // Update failed count
+        await db
+          .collection("parallelOperations")
+          .updateOne({ operationId }, { $inc: { failedAccounts: 1 } });
+
+        return {
+          account: account.name,
+          success: false,
+          error: error.message,
+        };
+      }
+    });
+
+    // Wait for all accounts to complete (with timeout)
+    const timeoutPromise = new Promise((_, reject) => {
+      setTimeout(
+        () => reject(new Error("Parallel processing timeout")),
+        11 * 60 * 1000
+      ); // 11 minutes
+    });
+
+    const results = await Promise.race([
+      Promise.all(accountPromises),
+      timeoutPromise,
+    ]);
+
+    // Update final operation status
+    const finalStatus = results.every((r) => r.success)
+      ? "completed"
+      : "completed_with_errors";
+    await db.collection("parallelOperations").updateOne(
+      { operationId },
+      {
+        $set: {
+          status: finalStatus,
+          endTime: new Date(),
+          duration: Date.now() - startTime,
+        },
+      }
+    );
+
+    const totalDuration = Date.now() - startTime;
+    const successfulUpdates = results.filter((r) => r.success).length;
+    const failedUpdates = results.filter((r) => !r.success).length;
+
+    console.log(
+      `📊 Parallel update completed: ${successfulUpdates} successful, ${failedUpdates} failed`
+    );
+
+    res.json({
+      operationId,
+      message: `Parallel update completed: ${successfulUpdates} successful, ${failedUpdates} failed`,
+      duration: totalDuration,
+      results: results,
+      timestamp: new Date().toISOString(),
+    });
+  } catch (error) {
+    const duration = Date.now() - startTime;
+    console.log(
+      `❌ Parallel update error after ${duration}ms: ${error.message}`
+    );
+    console.error("Full error:", error);
+
+    res.status(500).json({
+      error: error.message,
+      duration: duration,
+      timestamp: new Date().toISOString(),
+    });
+  }
+});
+
+// Worker function for individual account processing
+app.post("/api/update-account-jobs/:accountId", async (req, res) => {
+  const accountStartTime = Date.now();
+  const { accountId } = req.params;
+  const operationId = req.get("X-Operation-ID");
+
+  try {
+    console.log(`🔄 Starting account worker for account ID: ${accountId}`);
+
+    await ensureDbConnection();
+
+    // Find account by ID
+    const account = await db.collection("accounts").findOne({
+      $or: [{ _id: new ObjectId(accountId) }, { id: accountId }],
+    });
+
+    if (!account) {
+      throw new Error("Account not found");
+    }
+
+    if (!account.workizApiToken) {
+      throw new Error("Missing API token for this account");
+    }
+
+    console.log(`📊 Processing account: ${account.name}`);
+
+    // Get all jobs for this account
+    const existingJobs = await db
+      .collection("jobs")
+      .find({ accountId: account._id })
+      .toArray();
+
+    if (existingJobs.length === 0) {
+      console.log(`⚠️ No jobs found for account: ${account.name}`);
+      return res.json({
+        account: account.name,
+        success: true,
+        jobsProcessed: 0,
+        jobsUpdated: 0,
+        jobsDeleted: 0,
+        duration: Date.now() - accountStartTime,
+      });
+    }
+
+    console.log(
+      `📊 Found ${existingJobs.length} jobs to update for ${account.name}`
+    );
+
+    // Process jobs with rate limiting
+    const BATCH_SIZE = 10;
+    const DELAY_BETWEEN_BATCHES = 15000; // 15 seconds between batches
+    let updatedJobsCount = 0;
+    let deletedJobsCount = 0;
+    let failedUpdatesCount = 0;
+    const errors = [];
+
+    // Calculate time budget (11 minutes to be safe)
+    const TIME_BUDGET = 11 * 60 * 1000; // 11 minutes
+    const startTime = Date.now();
+
+    for (let i = 0; i < existingJobs.length; i += BATCH_SIZE) {
+      // Check if we're running out of time
+      if (Date.now() - startTime > TIME_BUDGET) {
+        console.log(
+          `⏰ Time budget exceeded for account ${account.name}, stopping at job ${i}`
+        );
+        break;
+      }
+
+      const batch = existingJobs.slice(i, i + BATCH_SIZE);
+      const batchNumber = Math.floor(i / BATCH_SIZE) + 1;
+      const totalBatches = Math.ceil(existingJobs.length / BATCH_SIZE);
+
+      console.log(
+        `📦 Processing batch ${batchNumber}/${totalBatches} (${batch.length} jobs) for ${account.name}`
+      );
+
+      for (const existingJob of batch) {
+        try {
+          // Update job using Workiz API
+          const updateUrl = `https://api.workiz.com/api/v1/${account.workizApiToken}/job/get/${existingJob.UUID}/`;
+
+          const updateResponse = await RetryHandler.withRetry(
+            async () => {
+              const resp = await APIManager.fetchWithTimeout(
+                updateUrl,
+                {},
+                30000
+              );
+
+              if (!resp.ok) {
+                const errorText = await resp.text();
+
+                // Handle 429 rate limiting specifically
+                if (resp.status === 429) {
+                  console.log(
+                    `⚠️ Rate limit hit for job ${existingJob.UUID}, waiting 60 seconds...`
+                  );
+                  await new Promise((resolve) => setTimeout(resolve, 60000));
+                  throw new Error(
+                    `Rate limited: ${resp.status} ${resp.statusText}`
+                  );
+                }
+
+                // Check if response is HTML (520 error page)
+                if (
+                  errorText.includes('<div class="text-container">') ||
+                  errorText.includes("Oops!") ||
+                  errorText.includes("Something went wrong")
+                ) {
+                  throw new Error(
+                    `Workiz API 520 error - server is experiencing issues`
+                  );
+                }
+
+                throw new Error(
+                  `Job update error: ${resp.status} - ${errorText}`
+                );
+              }
+
+              return resp;
+            },
+            3,
+            2000,
+            workizCircuitBreaker
+          );
+
+          if (updateResponse.ok) {
+            const updateData = await updateResponse.json();
+
+            if (updateData.flag && updateData.data) {
+              // Update the job with fresh data from Workiz
+              const updatedJob = {
+                ...updateData.data,
+                accountId: account._id,
+                lastUpdated: new Date(),
+              };
+
+              await RetryHandler.withRetry(async () => {
+                await db
+                  .collection("jobs")
+                  .updateOne({ UUID: existingJob.UUID }, { $set: updatedJob });
+              });
+
+              updatedJobsCount++;
+            } else {
+              // Job might have been deleted in Workiz, so delete from our database
+              await RetryHandler.withRetry(async () => {
+                await db
+                  .collection("jobs")
+                  .deleteOne({ UUID: existingJob.UUID });
+              });
+              deletedJobsCount++;
+            }
+          } else {
+            failedUpdatesCount++;
+          }
+
+          // Rate limiting: 6-second delay between API calls (10 calls per minute)
+          await new Promise((resolve) => setTimeout(resolve, 6000));
+        } catch (error) {
+          console.log(
+            `❌ Failed to update job ${existingJob.UUID}: ${error.message}`
+          );
+          failedUpdatesCount++;
+          errors.push(`Job ${existingJob.UUID}: ${error.message}`);
+        }
+      }
+
+      // Add delay between batches (except for the last batch)
+      if (i + BATCH_SIZE < existingJobs.length) {
+        await new Promise((resolve) =>
+          setTimeout(resolve, DELAY_BETWEEN_BATCHES)
+        );
+      }
+    }
+
+    const accountDuration = Date.now() - accountStartTime;
+
+    console.log(
+      `✅ Account ${account.name} completed: ${updatedJobsCount} updated, ${deletedJobsCount} deleted, ${failedUpdatesCount} failed`
+    );
+
+    // Record sync history
+    const syncHistoryRecord = {
+      accountId: account._id,
+      syncType: "jobs_uuid_update",
+      status: "success",
+      timestamp: new Date(),
+      duration: accountDuration,
+      details: {
+        totalJobs: existingJobs.length,
+        jobsUpdated: updatedJobsCount,
+        jobsDeleted: deletedJobsCount,
+        failedUpdates: failedUpdatesCount,
+        syncMethod: "parallel_worker",
+        operationId: operationId,
+      },
+    };
+
+    await RetryHandler.withRetry(async () => {
+      await db.collection("syncHistory").insertOne(syncHistoryRecord);
+    });
+
+    res.json({
+      account: account.name,
+      success: true,
+      jobsProcessed: existingJobs.length,
+      jobsUpdated: updatedJobsCount,
+      jobsDeleted: deletedJobsCount,
+      failedUpdates: failedUpdatesCount,
+      errors: errors,
+      duration: accountDuration,
+    });
+  } catch (error) {
+    const duration = Date.now() - accountStartTime;
+    console.log(
+      `❌ Account worker error after ${duration}ms: ${error.message}`
+    );
+    console.error("Full error:", error);
+
+    res.status(500).json({
+      account: accountId,
+      success: false,
+      error: error.message,
+      duration: duration,
+    });
+  }
+});
+
+// Get parallel operation status
+app.get("/api/parallel-operation/:operationId", async (req, res) => {
+  try {
+    const { operationId } = req.params;
+    await ensureDbConnection();
+
+    const operation = await db
+      .collection("parallelOperations")
+      .findOne({ operationId });
+
+    if (!operation) {
+      return res.status(404).json({ error: "Operation not found" });
+    }
+
+    res.json(operation);
+  } catch (error) {
+    console.error("Error fetching operation status:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
