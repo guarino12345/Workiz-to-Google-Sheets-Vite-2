@@ -563,131 +563,17 @@ app.post("/api/sync-jobs/:accountId", async (req, res) => {
     const cutoffDate = new Date();
     cutoffDate.setDate(cutoffDate.getDate() - 32);
 
-    let updatedJobsCount = 0;
-    let deletedJobsCount = 0;
-    let failedUpdatesCount = 0;
+    // Clean up old jobs (older than 32 days)
+    console.log(`🧹 Cleaning up old jobs (older than 32 days)...`);
 
-    // Process jobs in batches (standardized with cron job)
-    const BATCH_SIZE = 15;
-    const DELAY_BETWEEN_BATCHES = 10000; // 10 seconds between batches
+    const deleteResult = await db.collection("jobs").deleteMany({
+      accountId: account._id,
+      JobDateTime: { $lt: cutoffDate.toISOString() },
+    });
 
-    for (let i = 0; i < existingJobs.length; i += BATCH_SIZE) {
-      const batch = existingJobs.slice(i, i + BATCH_SIZE);
-      const batchNumber = Math.floor(i / BATCH_SIZE) + 1;
-      const totalBatches = Math.ceil(existingJobs.length / BATCH_SIZE);
-
-      // Process each job in the current batch
-      for (const existingJob of batch) {
-        try {
-          const jobDate = new Date(existingJob.JobDateTime);
-
-          // Check if job is older than 32 days
-          if (jobDate < cutoffDate) {
-            await RetryHandler.withRetry(async () => {
-              await db.collection("jobs").deleteOne({ UUID: existingJob.UUID });
-            });
-            deletedJobsCount++;
-            continue;
-          }
-
-          // Update job using Workiz API
-          console.log(`🔄 Updating job: ${existingJob.UUID}`);
-          const updateUrl = `https://api.workiz.com/api/v1/${account.workizApiToken}/job/get/${existingJob.UUID}/`;
-
-          const updateResponse = await RetryHandler.withRetry(
-            async () => {
-              const resp = await APIManager.fetchWithTimeout(
-                updateUrl,
-                {},
-                30000
-              );
-
-              if (!resp.ok) {
-                const errorText = await resp.text();
-
-                // Handle 429 rate limiting specifically
-                if (resp.status === 429) {
-                  console.log(
-                    `⚠️ Rate limit hit for job ${existingJob.UUID}, waiting 60 seconds...`
-                  );
-                  await new Promise((resolve) => setTimeout(resolve, 60000));
-                  throw new Error(
-                    `Rate limited: ${resp.status} ${resp.statusText}`
-                  );
-                }
-
-                // Check if response is HTML (520 error page)
-                if (
-                  errorText.includes('<div class="text-container">') ||
-                  errorText.includes("Oops!") ||
-                  errorText.includes("Something went wrong")
-                ) {
-                  throw new Error(
-                    `Workiz API 520 error - server is experiencing issues`
-                  );
-                }
-
-                throw new Error(
-                  `Job update error: ${resp.status} - ${errorText}`
-                );
-              }
-
-              return resp;
-            },
-            3,
-            1000,
-            workizCircuitBreaker
-          ); // 3 retries, 1s base delay, with circuit breaker
-
-          if (updateResponse.ok) {
-            const updateData = await updateResponse.json();
-
-            if (updateData.flag && updateData.data) {
-              // Update the job with fresh data from Workiz
-              const updatedJob = {
-                ...updateData.data,
-                accountId: account._id || account.id,
-              };
-
-              await RetryHandler.withRetry(async () => {
-                await db
-                  .collection("jobs")
-                  .updateOne({ UUID: existingJob.UUID }, { $set: updatedJob });
-              });
-
-              updatedJobsCount++;
-            } else {
-              // Job might have been deleted in Workiz, so delete from our database
-              await RetryHandler.withRetry(async () => {
-                await db
-                  .collection("jobs")
-                  .deleteOne({ UUID: existingJob.UUID });
-              });
-              deletedJobsCount++;
-            }
-          } else {
-            failedUpdatesCount++;
-          }
-
-          // Rate limiting: 5-second delay between API calls (12 calls per minute)
-          await new Promise((resolve) => setTimeout(resolve, 5000));
-        } catch (error) {
-          failedUpdatesCount++;
-        }
-      }
-
-      // Add delay between batches (except for the last batch)
-      if (i + BATCH_SIZE < existingJobs.length) {
-        await new Promise((resolve) =>
-          setTimeout(resolve, DELAY_BETWEEN_BATCHES)
-        );
-      }
-    }
-
-    console.log(`📊 Job update and cleanup completed:`);
-    console.log(`   - Updated: ${updatedJobsCount} jobs`);
-    console.log(`   - Deleted (old): ${deletedJobsCount} jobs`);
-    console.log(`   - Failed updates: ${failedUpdatesCount} jobs`);
+    console.log(
+      `📊 Cleanup completed: ${deleteResult.deletedCount} old jobs deleted`
+    );
 
     // Record sync history
     const syncHistoryRecord = {
@@ -701,9 +587,7 @@ app.post("/api/sync-jobs/:accountId", async (req, res) => {
         filteredJobs: jobs.length,
         existingJobsFound: existingJobs.length,
         finalJobCount: finalJobCount,
-        jobsUpdated: updatedJobsCount,
-        jobsDeleted: deletedJobsCount,
-        failedUpdates: failedUpdatesCount,
+        jobsDeleted: deleteResult.deletedCount,
         syncMethod: "manual_standardized",
         sourceFilter: account.sourceFilter,
         jobStatusBreakdown: {
@@ -745,9 +629,7 @@ app.post("/api/sync-jobs/:accountId", async (req, res) => {
         filteredJobs: jobs.length,
         existingJobsFound: existingJobs.length,
         finalJobCount: finalJobCount,
-        jobsUpdated: updatedJobsCount,
-        jobsDeleted: deletedJobsCount,
-        failedUpdates: failedUpdatesCount,
+        jobsDeleted: deleteResult.deletedCount,
         sourceFilter: account.sourceFilter,
       },
     });
@@ -1596,7 +1478,7 @@ app.get("/api/cron/sync-jobs", async (req, res) => {
           }
         );
 
-        // Process batches with rate limiting (same as parallel sync)
+        // Process jobs in batches (simplified - no individual UUID updates)
         let processedJobs = 0;
         let updatedJobsCount = 0;
         let failedUpdatesCount = 0;
@@ -1605,7 +1487,7 @@ app.get("/api/cron/sync-jobs", async (req, res) => {
           const batch = batches[batchIndex];
           const batchStartTime = Date.now();
 
-          // Update batch status - using arrayFilters to avoid nested positional operators
+          // Update batch status
           await db.collection("syncSessions").updateOne(
             {
               sessionId: syncSession.sessionId,
@@ -1625,66 +1507,29 @@ app.get("/api/cron/sync-jobs", async (req, res) => {
             }
           );
 
-          // Process each job in the batch with individual API calls
+          // Process each job in the batch (using data from Workiz list API)
           for (let jobIndex = 0; jobIndex < batch.length; jobIndex++) {
             const job = batch[jobIndex];
 
             try {
-              // Fetch detailed job data
-              const detailUrl = `https://api.workiz.com/api/v1/${account.workizApiToken}/job/get/${job.UUID}/`;
-
-              const detailResponse = await RetryHandler.withRetry(
-                () => APIManager.fetchWithTimeout(detailUrl, {}, 30000),
-                3,
-                2000,
-                workizCircuitBreaker
-              );
-
-              if (!detailResponse.ok) {
-                if (detailResponse.status === 429) {
-                  console.log(
-                    `⚠️ Rate limit hit for job ${job.UUID}, waiting 60 seconds...`
-                  );
-                  await new Promise((resolve) => setTimeout(resolve, 60000));
-                  throw new Error(
-                    `Rate limited: ${detailResponse.status} ${detailResponse.statusText}`
-                  );
-                }
-                throw new Error(
-                  `Workiz API error: ${detailResponse.status} ${detailResponse.statusText}`
-                );
-              }
-
-              const detailData = await detailResponse.json();
-
-              if (!detailData.flag || !detailData.data) {
-                throw new Error(
-                  "Invalid response from Workiz API for job details"
-                );
-              }
-
-              const detailedJob = {
-                ...detailData.data,
+              // Add accountId and lastUpdated to job data
+              const jobWithMetadata = {
+                ...job,
                 accountId: account._id,
                 lastUpdated: new Date(),
               };
 
               // Update or insert job in database
-              const result = await db
+              await db
                 .collection("jobs")
                 .updateOne(
                   { UUID: job.UUID, accountId: account._id },
-                  { $set: detailedJob },
+                  { $set: jobWithMetadata },
                   { upsert: true }
                 );
 
               updatedJobsCount++;
               processedJobs++;
-
-              // Rate limiting: 5-second delay between API calls (12 calls per minute)
-              if (jobIndex < batch.length - 1) {
-                await new Promise((resolve) => setTimeout(resolve, 5000));
-              }
             } catch (error) {
               failedUpdatesCount++;
               processedJobs++;
@@ -1693,12 +1538,7 @@ app.get("/api/cron/sync-jobs", async (req, res) => {
 
           const batchDuration = Date.now() - batchStartTime;
 
-          // Add delay between batches to prevent rate limiting
-          if (batchIndex < batches.length - 1) {
-            await new Promise((resolve) => setTimeout(resolve, 10000));
-          }
-
-          // Update batch status - using arrayFilters to avoid nested positional operators
+          // Update batch status
           await db.collection("syncSessions").updateOne(
             {
               sessionId: syncSession.sessionId,
@@ -2696,68 +2536,30 @@ app.post("/api/sync/parallel/account/:accountId", async (req, res) => {
         );
       }
 
-      // Process each job in the batch with individual API calls
+      // Process each job in the batch (using data from Workiz list API)
       for (let jobIndex = 0; jobIndex < batch.length; jobIndex++) {
         const job = batch[jobIndex];
 
         try {
-          // Fetch detailed job data
-          const detailUrl = `https://api.workiz.com/api/v1/${account.workizToken}/job/get/${job.UUID}/`;
-
-          const detailResponse = await RetryHandler.withRetry(
-            () => APIManager.fetchWithTimeout(detailUrl, {}, 30000),
-            3,
-            2000,
-            workizCircuitBreaker
-          );
-
-          if (!detailResponse.ok) {
-            if (detailResponse.status === 429) {
-              console.log(
-                `⚠️ Rate limit hit for job ${job.UUID}, waiting 60 seconds...`
-              );
-              await new Promise((resolve) => setTimeout(resolve, 60000));
-              throw new Error(
-                `Rate limited: ${detailResponse.status} ${detailResponse.statusText}`
-              );
-            }
-            throw new Error(
-              `Workiz API error: ${detailResponse.status} ${detailResponse.statusText}`
-            );
-          }
-
-          const detailData = await detailResponse.json();
-
-          if (!detailData.flag || !detailData.data) {
-            throw new Error("Invalid response from Workiz API for job details");
-          }
-
-          const detailedJob = {
-            ...detailData.data,
+          // Add accountId and lastUpdated to job data
+          const jobWithMetadata = {
+            ...job,
             accountId: account._id,
             lastUpdated: new Date(),
           };
 
           // Update or insert job in database
-          const result = await db
+          await db
             .collection("jobs")
             .updateOne(
               { UUID: job.UUID, accountId: account._id },
-              { $set: detailedJob },
+              { $set: jobWithMetadata },
               { upsert: true }
             );
 
-          // Job processed successfully (logging removed for Vercel log limit)
-
           updatedJobsCount++;
           processedJobs++;
-
-          // Rate limiting: 2-second delay between API calls (30 calls per minute)
-          if (jobIndex < batch.length - 1) {
-            await new Promise((resolve) => setTimeout(resolve, delayMs));
-          }
         } catch (error) {
-          // Job failed (logging removed for Vercel log limit)
           failedUpdatesCount++;
           processedJobs++;
         }
@@ -3020,6 +2822,267 @@ app.get("/api/sync/parallel/sessions", async (req, res) => {
     res.status(500).json({
       error: "Failed to get sync sessions",
       message: error.message,
+    });
+  }
+});
+
+// Cron job endpoint for updating jobs using UUID - runs at 2am UTC
+app.get("/api/cron/update-jobs-uuid", async (req, res) => {
+  const startTime = Date.now();
+
+  try {
+    // Enhanced security validation
+    const userAgent = req.get("User-Agent");
+    const clientIP = req.ip || req.connection.remoteAddress;
+
+    console.log(`🕐 UUID Update Cron started at ${new Date().toISOString()}`);
+    console.log(`📊 User-Agent: ${userAgent}`);
+    console.log(`🌐 Client IP: ${clientIP}`);
+
+    // Validate cron job request
+    if (!userAgent || !userAgent.includes("Vercel")) {
+      console.log(`❌ Invalid cron job request from: ${clientIP}`);
+      return res.status(403).json({
+        error: "Unauthorized cron job request",
+        timestamp: new Date().toISOString(),
+      });
+    }
+
+    await ensureDbConnection();
+
+    // Get all active accounts
+    const accounts = await db.collection("accounts").find({}).toArray();
+
+    if (accounts.length === 0) {
+      console.log(`⚠️ No accounts found for UUID update`);
+      return res.json({
+        message: "No accounts to update",
+        timestamp: new Date().toISOString(),
+      });
+    }
+
+    console.log(`📋 Found ${accounts.length} accounts for UUID update`);
+
+    // Process each account
+    const results = [];
+    for (const account of accounts) {
+      const accountStartTime = Date.now();
+      console.log(`🔄 Processing account: ${account.name}`);
+
+      try {
+        // Get all jobs for this account
+        const existingJobs = await db
+          .collection("jobs")
+          .find({ accountId: account._id })
+          .toArray();
+
+        if (existingJobs.length === 0) {
+          console.log(`⚠️ No jobs found for account: ${account.name}`);
+          results.push({
+            account: account.name,
+            success: true,
+            jobsUpdated: 0,
+            jobsDeleted: 0,
+            failedUpdates: 0,
+            duration: Date.now() - accountStartTime,
+          });
+          continue;
+        }
+
+        console.log(
+          `📊 Found ${existingJobs.length} jobs to update for ${account.name}`
+        );
+
+        // Process jobs in batches
+        const BATCH_SIZE = 10;
+        const DELAY_BETWEEN_BATCHES = 15000; // 15 seconds between batches
+        let updatedJobsCount = 0;
+        let deletedJobsCount = 0;
+        let failedUpdatesCount = 0;
+
+        for (let i = 0; i < existingJobs.length; i += BATCH_SIZE) {
+          const batch = existingJobs.slice(i, i + BATCH_SIZE);
+          const batchNumber = Math.floor(i / BATCH_SIZE) + 1;
+          const totalBatches = Math.ceil(existingJobs.length / BATCH_SIZE);
+
+          console.log(
+            `📦 Processing batch ${batchNumber}/${totalBatches} (${batch.length} jobs)`
+          );
+
+          for (const existingJob of batch) {
+            try {
+              // Update job using Workiz API
+              const updateUrl = `https://api.workiz.com/api/v1/${account.workizApiToken}/job/get/${existingJob.UUID}/`;
+
+              const updateResponse = await RetryHandler.withRetry(
+                async () => {
+                  const resp = await APIManager.fetchWithTimeout(
+                    updateUrl,
+                    {},
+                    30000
+                  );
+
+                  if (!resp.ok) {
+                    const errorText = await resp.text();
+
+                    // Handle 429 rate limiting specifically
+                    if (resp.status === 429) {
+                      console.log(
+                        `⚠️ Rate limit hit for job ${existingJob.UUID}, waiting 60 seconds...`
+                      );
+                      await new Promise((resolve) =>
+                        setTimeout(resolve, 60000)
+                      );
+                      throw new Error(
+                        `Rate limited: ${resp.status} ${resp.statusText}`
+                      );
+                    }
+
+                    // Check if response is HTML (520 error page)
+                    if (
+                      errorText.includes('<div class="text-container">') ||
+                      errorText.includes("Oops!") ||
+                      errorText.includes("Something went wrong")
+                    ) {
+                      throw new Error(
+                        `Workiz API 520 error - server is experiencing issues`
+                      );
+                    }
+
+                    throw new Error(
+                      `Job update error: ${resp.status} - ${errorText}`
+                    );
+                  }
+
+                  return resp;
+                },
+                3,
+                2000,
+                workizCircuitBreaker
+              );
+
+              if (updateResponse.ok) {
+                const updateData = await updateResponse.json();
+
+                if (updateData.flag && updateData.data) {
+                  // Update the job with fresh data from Workiz
+                  const updatedJob = {
+                    ...updateData.data,
+                    accountId: account._id,
+                    lastUpdated: new Date(),
+                  };
+
+                  await RetryHandler.withRetry(async () => {
+                    await db
+                      .collection("jobs")
+                      .updateOne(
+                        { UUID: existingJob.UUID },
+                        { $set: updatedJob }
+                      );
+                  });
+
+                  updatedJobsCount++;
+                } else {
+                  // Job might have been deleted in Workiz, so delete from our database
+                  await RetryHandler.withRetry(async () => {
+                    await db
+                      .collection("jobs")
+                      .deleteOne({ UUID: existingJob.UUID });
+                  });
+                  deletedJobsCount++;
+                }
+              } else {
+                failedUpdatesCount++;
+              }
+
+              // Rate limiting: 6-second delay between API calls (10 calls per minute)
+              await new Promise((resolve) => setTimeout(resolve, 6000));
+            } catch (error) {
+              console.log(
+                `❌ Failed to update job ${existingJob.UUID}: ${error.message}`
+              );
+              failedUpdatesCount++;
+            }
+          }
+
+          // Add delay between batches (except for the last batch)
+          if (i + BATCH_SIZE < existingJobs.length) {
+            await new Promise((resolve) =>
+              setTimeout(resolve, DELAY_BETWEEN_BATCHES)
+            );
+          }
+        }
+
+        const accountDuration = Date.now() - accountStartTime;
+
+        console.log(
+          `✅ Account ${account.name} completed: ${updatedJobsCount} updated, ${deletedJobsCount} deleted, ${failedUpdatesCount} failed`
+        );
+
+        // Record sync history
+        const syncHistoryRecord = {
+          accountId: account._id,
+          syncType: "jobs_uuid_update",
+          status: "success",
+          timestamp: new Date(),
+          duration: accountDuration,
+          details: {
+            totalJobs: existingJobs.length,
+            jobsUpdated: updatedJobsCount,
+            jobsDeleted: deletedJobsCount,
+            failedUpdates: failedUpdatesCount,
+            syncMethod: "cron_uuid_update",
+          },
+        };
+
+        await RetryHandler.withRetry(async () => {
+          await db.collection("syncHistory").insertOne(syncHistoryRecord);
+        });
+
+        results.push({
+          account: account.name,
+          success: true,
+          jobsUpdated: updatedJobsCount,
+          jobsDeleted: deletedJobsCount,
+          failedUpdates: failedUpdatesCount,
+          duration: accountDuration,
+        });
+      } catch (error) {
+        console.error(`❌ Error processing account ${account.name}:`, error);
+        results.push({
+          account: account.name,
+          success: false,
+          error: error.message,
+          duration: Date.now() - accountStartTime,
+        });
+      }
+    }
+
+    const totalDuration = Date.now() - startTime;
+    const successfulUpdates = results.filter((r) => r.success).length;
+    const failedUpdates = results.filter((r) => !r.success).length;
+
+    console.log(
+      `📊 UUID Update Cron completed: ${successfulUpdates} successful, ${failedUpdates} failed`
+    );
+
+    res.json({
+      message: `UUID Update Cron completed: ${successfulUpdates} successful, ${failedUpdates} failed`,
+      duration: totalDuration,
+      results: results,
+      timestamp: new Date().toISOString(),
+    });
+  } catch (error) {
+    const duration = Date.now() - startTime;
+    console.log(
+      `❌ UUID Update Cron error after ${duration}ms: ${error.message}`
+    );
+    console.error("Full error:", error);
+
+    res.status(500).json({
+      error: error.message,
+      duration: duration,
+      timestamp: new Date().toISOString(),
     });
   }
 });

@@ -29,8 +29,12 @@
       "schedule": "0 1 * * *"
     },
     {
-      "path": "/api/cron/sync-sheets",
+      "path": "/api/cron/update-jobs-uuid",
       "schedule": "0 2 * * *"
+    },
+    {
+      "path": "/api/cron/sync-sheets",
+      "schedule": "0 4 * * *"
     }
   ],
   "env": {

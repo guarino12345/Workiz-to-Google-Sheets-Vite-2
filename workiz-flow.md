@@ -999,3 +999,5 @@ Job Default 80 (conversion value in the account)
 When job has value or not = to 0 then change the value (JobTotalPrice)
 
 Cancelled then Change Value to 0
+
+-- updated what is inside the database by batch so what will happen is all accounts have apis so we can update all accounts at the same time within 12 minutes the vercel fucntion timeout (have this as another cron job) so for every batch it should only have 12mintes of job updating time
