@@ -3000,8 +3000,8 @@ app.get("/api/cron/update-jobs-uuid", async (req, res) => {
                 failedUpdatesCount++;
               }
 
-              // Rate limiting: 6-second delay between API calls (10 calls per minute)
-              await new Promise((resolve) => setTimeout(resolve, 6000));
+              // Rate limiting: 3-second delay between API calls (20 calls per minute)
+              await new Promise((resolve) => setTimeout(resolve, 3000));
             } catch (error) {
               console.log(
                 `❌ Failed to update job ${existingJob.UUID}: ${error.message}`
@@ -3451,8 +3451,8 @@ app.post("/api/update-account-jobs/:accountId", async (req, res) => {
             failedUpdatesCount++;
           }
 
-          // Rate limiting: 6-second delay between API calls (10 calls per minute)
-          await new Promise((resolve) => setTimeout(resolve, 6000));
+          // Rate limiting: 3-second delay between API calls (20 calls per minute)
+          await new Promise((resolve) => setTimeout(resolve, 3000));
         } catch (error) {
           console.log(
             `❌ Failed to update job ${existingJob.UUID}: ${error.message}`
@@ -3792,5 +3792,222 @@ app.get("/api/parallel-operation/:operationId", async (req, res) => {
   } catch (error) {
     console.error("Error fetching operation status:", error);
     res.status(500).json({ error: error.message });
+  }
+});
+
+// --- BATCH LIFECYCLE MANAGEMENT ---
+
+// 1. Batch Initialization: Create batches for each account when update is triggered
+app.post("/api/initiate-batch-update", async (req, res) => {
+  try {
+    await ensureDbConnection();
+    const accounts = await db.collection("accounts").find({}).toArray();
+    if (!accounts.length)
+      return res.status(400).json({ error: "No accounts found" });
+
+    const operationId = new ObjectId().toString();
+    const BATCH_SIZE = 10;
+    const now = new Date();
+    let batchInserts = [];
+    let accountStates = [];
+
+    for (const account of accounts) {
+      const jobs = await db
+        .collection("jobs")
+        .find({ accountId: account._id })
+        .toArray();
+      const totalBatches = Math.ceil(jobs.length / BATCH_SIZE);
+      for (let i = 0; i < totalBatches; i++) {
+        const batchJobs = jobs
+          .slice(i * BATCH_SIZE, (i + 1) * BATCH_SIZE)
+          .map((j) => j.UUID);
+        batchInserts.push({
+          operationId,
+          accountId: account._id,
+          batchNumber: i + 1,
+          status: i === 0 ? "pending" : "waiting", // Only first batch is ready to run
+          jobUUIDs: batchJobs,
+          completedJobs: [],
+          failedJobs: [],
+          startTime: null,
+          endTime: null,
+          errors: [],
+        });
+      }
+      accountStates.push({
+        operationId,
+        accountId: account._id,
+        currentBatch: 1,
+        totalBatches,
+        status: "processing",
+        lastBatchCompleted: 0,
+        nextBatchToProcess: 1,
+        startTime: now,
+        endTime: null,
+      });
+    }
+    if (batchInserts.length)
+      await db.collection("batches").insertMany(batchInserts);
+    if (accountStates.length)
+      await db.collection("batchAccountStates").insertMany(accountStates);
+
+    // Trigger first batch for each account
+    const firstBatches = batchInserts.filter(
+      (batch) => batch.batchNumber === 1
+    );
+    for (const batch of firstBatches) {
+      // Fire-and-forget trigger for first batch
+      setTimeout(async () => {
+        try {
+          await fetch(
+            `${req.protocol}://${req.get("host")}/api/process-batch/${
+              batch._id
+            }`,
+            {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+            }
+          );
+        } catch (error) {
+          console.error(
+            `Failed to trigger first batch for account ${batch.accountId}:`,
+            error
+          );
+        }
+      }, 1000);
+    }
+
+    res.json({
+      operationId,
+      accounts: accountStates.length,
+      batches: batchInserts.length,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// 2. Batch Processing Endpoint
+app.post("/api/process-batch/:batchId", async (req, res) => {
+  const { batchId } = req.params;
+  try {
+    await ensureDbConnection();
+    const batch = await db
+      .collection("batches")
+      .findOne({ _id: new ObjectId(batchId) });
+    if (!batch) return res.status(404).json({ error: "Batch not found" });
+    if (batch.status === "completed" || batch.status === "processing") {
+      return res
+        .status(400)
+        .json({ error: "Batch already processed or running" });
+    }
+    // Lock: ensure no other batch for this account is processing
+    const processing = await db.collection("batches").findOne({
+      operationId: batch.operationId,
+      accountId: batch.accountId,
+      status: "processing",
+    });
+    if (processing)
+      return res
+        .status(409)
+        .json({ error: "Another batch is processing for this account" });
+
+    // Mark this batch as processing
+    await db
+      .collection("batches")
+      .updateOne(
+        { _id: batch._id },
+        { $set: { status: "processing", startTime: new Date() } }
+      );
+    let completedJobs = [],
+      failedJobs = [],
+      errors = [];
+    for (const uuid of batch.jobUUIDs) {
+      try {
+        // Simulate job update (replace with real update logic)
+        // await updateJob(uuid);
+        completedJobs.push(uuid);
+        await new Promise((r) => setTimeout(r, 3000)); // 3s delay per job
+      } catch (e) {
+        failedJobs.push(uuid);
+        errors.push(`Job ${uuid}: ${e.message}`);
+      }
+    }
+    // Mark batch as completed
+    await db.collection("batches").updateOne(
+      { _id: batch._id },
+      {
+        $set: {
+          status: "completed",
+          completedJobs,
+          failedJobs,
+          endTime: new Date(),
+          errors,
+        },
+      }
+    );
+    // Update account state
+    const accountState = await db
+      .collection("batchAccountStates")
+      .findOne({ operationId: batch.operationId, accountId: batch.accountId });
+    let nextBatchNum = batch.batchNumber + 1;
+    await db.collection("batchAccountStates").updateOne(
+      { operationId: batch.operationId, accountId: batch.accountId },
+      {
+        $set: {
+          lastBatchCompleted: batch.batchNumber,
+          nextBatchToProcess:
+            nextBatchNum > accountState.totalBatches ? null : nextBatchNum,
+          status:
+            nextBatchNum > accountState.totalBatches
+              ? "completed"
+              : "processing",
+          endTime: nextBatchNum > accountState.totalBatches ? new Date() : null,
+        },
+      }
+    );
+    // Trigger next batch if exists
+    if (nextBatchNum <= accountState.totalBatches) {
+      const nextBatch = await db.collection("batches").findOne({
+        operationId: batch.operationId,
+        accountId: batch.accountId,
+        batchNumber: nextBatchNum,
+      });
+      if (nextBatch) {
+        await db
+          .collection("batches")
+          .updateOne({ _id: nextBatch._id }, { $set: { status: "pending" } });
+        // Fire-and-forget trigger (simulate HTTP call or use queue/cron in production)
+        setTimeout(() => {
+          fetch(`/api/process-batch/${nextBatch._id}`, { method: "POST" });
+        }, 1000);
+      }
+    }
+    res.json({ batchId, completedJobs, failedJobs, errors });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// 3. Progress Endpoint
+app.get("/api/batch-progress/:operationId", async (req, res) => {
+  const { operationId } = req.params;
+  try {
+    await ensureDbConnection();
+    const accounts = await db
+      .collection("batchAccountStates")
+      .find({ operationId })
+      .toArray();
+    const batches = await db
+      .collection("batches")
+      .find({ operationId })
+      .toArray();
+    res.json({
+      operationId,
+      accounts,
+      batches,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
   }
 });

@@ -66,6 +66,9 @@ interface SyncResult {
     successfulAccounts?: number;
     totalAccounts?: number;
     failedAccounts?: number;
+    totalBatches?: number;
+    completedBatches?: number;
+    failedBatches?: number;
     operationId?: string;
     resumeInfo?: any;
   };
@@ -259,7 +262,7 @@ const JobList: React.FC<JobListProps> = ({ accounts }) => {
     }
   };
 
-  // Update All Jobs - updates existing jobs by UUID using fire-and-forget parallel processing
+  // Update All Jobs - updates existing jobs by UUID using batch lifecycle management
   const handleUpdateAllJobs = async () => {
     setUpdatingJobs(true);
     setError('');
@@ -267,20 +270,20 @@ const JobList: React.FC<JobListProps> = ({ accounts }) => {
     setShowSyncDetails(false);
     
     // Initialize progress
-    updateSyncProgress('fetching', 0, 'Initializing fire-and-forget parallel job updates...');
+    updateSyncProgress('fetching', 0, 'Initializing batch job updates...');
     
     try {
-      console.log('Starting fire-and-forget parallel job updates for all accounts');
+      console.log('Starting batch job updates for all accounts');
       
-      updateSyncProgress('fetching', 10, 'Preparing parallel processing...');
+      updateSyncProgress('fetching', 10, 'Preparing batch processing...');
       await new Promise<void>(resolve => setTimeout(resolve, 500));
       
-      updateSyncProgress('fetching', 25, 'Triggering parallel workers...');
+      updateSyncProgress('fetching', 25, 'Creating job batches...');
       await new Promise<void>(resolve => setTimeout(resolve, 500));
       
-      // Call the fire-and-forget parallel processing endpoint
+      // Call the batch initialization endpoint
       const response = await fetch(
-        buildApiUrl(`/api/update-all-jobs-parallel`),
+        buildApiUrl(`/api/initiate-batch-update`),
         { 
           method: 'POST',
           headers: {
@@ -291,11 +294,11 @@ const JobList: React.FC<JobListProps> = ({ accounts }) => {
       
       if (!response.ok) {
         const errorData = await response.json() as { error?: string };
-        const errorMessage = errorData.error || 'Failed to initiate job updates';
+        const errorMessage = errorData.error || 'Failed to initiate batch updates';
         setError(errorMessage);
         setSyncResult({
           success: false,
-          message: 'Update initiation failed',
+          message: 'Batch initiation failed',
           timestamp: new Date()
         });
         return;
@@ -303,20 +306,18 @@ const JobList: React.FC<JobListProps> = ({ accounts }) => {
       
       const result = await response.json() as { 
         operationId?: string; 
-        message?: string;
-        totalAccounts?: number;
-        triggeredAccounts?: number;
-        status?: string;
+        accounts?: number;
+        batches?: number;
       };
       
-      console.log('Fire-and-forget initiated:', result);
+      console.log('Batch initialization completed:', result);
       
       if (result.operationId) {
         setCurrentOperationId(result.operationId);
-        updateSyncProgress('processing', 40, 'Workers are running independently. Monitoring progress...');
+        updateSyncProgress('processing', 40, 'Batches are being processed. Monitoring progress...');
         
-        // Start polling for progress
-        await pollProgress(result.operationId);
+        // Start polling for batch progress
+        await pollBatchProgress(result.operationId);
       } else {
         throw new Error('No operation ID received from server');
       }
@@ -335,82 +336,94 @@ const JobList: React.FC<JobListProps> = ({ accounts }) => {
     }
   };
 
-  // Poll progress for fire-and-forget operations
-  const pollProgress = async (operationId: string) => {
-    const maxAttempts = 60; // 5 minutes with 5-second intervals
+  // Poll progress for batch operations
+  const pollBatchProgress = async (operationId: string) => {
+    const maxAttempts = 120; // 10 minutes with 5-second intervals
     let attempts = 0;
     
     const poll = async (): Promise<void> => {
       try {
-        const response = await fetch(buildApiUrl(`/api/parallel-progress/${operationId}`));
+        const response = await fetch(buildApiUrl(`/api/batch-progress/${operationId}`));
         
         if (!response.ok) {
-          throw new Error('Failed to fetch progress');
+          throw new Error('Failed to fetch batch progress');
         }
         
         const progress = await response.json() as {
-          status: string;
-          progress: {
-            totalAccounts: number;
-            completedAccounts: number;
-            failedAccounts: number;
-            runningAccounts: number;
-            completionPercentage: number;
-          };
-          jobs: {
-            totalProcessed: number;
-            totalUpdated: number;
-            totalDeleted: number;
-          };
+          operationId: string;
           accounts: Array<{
-            accountName: string;
+            accountId: string;
+            currentBatch: number;
+            totalBatches: number;
             status: string;
-            jobsProcessed: number;
-            jobsUpdated: number;
-            jobsDeleted: number;
-            canResume: boolean;
-            resumePoint?: string;
+            lastBatchCompleted: number;
+            nextBatchToProcess: number | null;
+            startTime: string;
+            endTime: string | null;
+          }>;
+          batches: Array<{
+            _id: string;
+            accountId: string;
+            batchNumber: number;
+            status: string;
+            jobUUIDs: string[];
+            completedJobs: string[];
+            failedJobs: string[];
+            startTime: string | null;
+            endTime: string | null;
+            errors: string[];
           }>;
         };
         
-        // Update progress display
-        const percentage = progress.progress.completionPercentage;
-        const phase = progress.status === 'completed' || progress.status === 'completed_with_errors' 
-          ? 'complete' 
-          : 'processing';
+        // Calculate overall progress
+        const totalAccounts = progress.accounts.length;
+        const completedAccounts = progress.accounts.filter(acc => acc.status === 'completed').length;
+        const processingAccounts = progress.accounts.filter(acc => acc.status === 'processing').length;
+        const failedAccounts = progress.accounts.filter(acc => acc.status === 'failed').length;
         
+        const totalBatches = progress.batches.length;
+        const completedBatches = progress.batches.filter(batch => batch.status === 'completed').length;
+        const processingBatches = progress.batches.filter(batch => batch.status === 'processing').length;
+        const failedBatches = progress.batches.filter(batch => batch.status === 'failed').length;
+        
+        const totalJobs = progress.batches.reduce((sum, batch) => sum + batch.jobUUIDs.length, 0);
+        const completedJobs = progress.batches.reduce((sum, batch) => sum + batch.completedJobs.length, 0);
+        const failedJobs = progress.batches.reduce((sum, batch) => sum + batch.failedJobs.length, 0);
+        
+        // Calculate completion percentage
+        const accountPercentage = totalAccounts > 0 ? (completedAccounts / totalAccounts) * 100 : 0;
+        const batchPercentage = totalBatches > 0 ? (completedBatches / totalBatches) * 100 : 0;
+        const overallPercentage = Math.round((accountPercentage + batchPercentage) / 2);
+        
+        // Determine phase
+        const isComplete = completedAccounts === totalAccounts;
+        const hasErrors = failedAccounts > 0 || failedBatches > 0;
+        const phase = isComplete ? 'complete' : 'processing';
+        
+        // Update progress display
         updateSyncProgress(
           phase, 
-          percentage, 
-          `Processing: ${progress.progress.completedAccounts}/${progress.progress.totalAccounts} accounts completed`,
-          `Jobs: ${progress.jobs.totalUpdated} updated, ${progress.jobs.totalDeleted} deleted`
+          overallPercentage, 
+          `Accounts: ${completedAccounts}/${totalAccounts} completed | Batches: ${completedBatches}/${totalBatches} completed`,
+          `Jobs: ${completedJobs} completed, ${failedJobs} failed`
         );
         
         // Check if operation is complete
-        if (progress.status === 'completed' || progress.status === 'completed_with_errors') {
-          // Check for accounts that can be resumed
-          const accountsWithResume = progress.accounts.filter(acc => acc.canResume);
-          if (accountsWithResume.length > 0) {
-            setResumeInfo(accountsWithResume.map(acc => ({
-              accountId: acc.accountName,
-              resumeFrom: acc.resumePoint,
-              jobsProcessed: acc.jobsProcessed,
-              jobsUpdated: acc.jobsUpdated,
-              jobsDeleted: acc.jobsDeleted
-            })));
-          }
-          
+        if (isComplete) {
           setSyncResult({
-            success: progress.status === 'completed',
-            message: progress.status === 'completed' 
-              ? `Successfully updated jobs across all ${progress.progress.totalAccounts} accounts`
-              : `Completed with errors: ${progress.progress.failedAccounts} accounts failed`,
+            success: !hasErrors,
+            message: hasErrors 
+              ? `Completed with errors: ${failedAccounts} accounts, ${failedBatches} batches failed`
+              : `Successfully completed all batches across ${totalAccounts} accounts`,
             details: {
-              jobsUpdated: progress.jobs.totalUpdated,
-              jobsDeleted: progress.jobs.totalDeleted,
-              successfulAccounts: progress.progress.completedAccounts,
-              totalAccounts: progress.progress.totalAccounts,
-              failedAccounts: progress.progress.failedAccounts,
+              jobsUpdated: completedJobs,
+              jobsDeleted: 0, // Not tracked in batch system
+              successfulAccounts: completedAccounts,
+              totalAccounts: totalAccounts,
+              failedAccounts: failedAccounts,
+              totalBatches: totalBatches,
+              completedBatches: completedBatches,
+              failedBatches: failedBatches,
               operationId: operationId
             },
             timestamp: new Date()
@@ -422,7 +435,7 @@ const JobList: React.FC<JobListProps> = ({ accounts }) => {
         // Continue polling if not complete
         attempts++;
         if (attempts >= maxAttempts) {
-          throw new Error('Progress polling timeout - operation may still be running');
+          throw new Error('Batch progress polling timeout - operation may still be running');
         }
         
         // Wait 5 seconds before next poll
@@ -430,7 +443,7 @@ const JobList: React.FC<JobListProps> = ({ accounts }) => {
         return poll();
         
       } catch (error) {
-        console.error('Progress polling error:', error);
+        console.error('Batch progress polling error:', error);
         throw error;
       }
     };
