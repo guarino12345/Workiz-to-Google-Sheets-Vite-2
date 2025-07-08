@@ -23,6 +23,11 @@
       "dest": "/dist/$1"
     }
   ],
+  "functions": {
+    "server.js": {
+      "maxDuration": 60
+    }
+  },
   "crons": [
     {
       "path": "/api/cron/sync-jobs",

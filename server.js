@@ -3183,55 +3183,117 @@ app.post("/api/initiate-batch-update", async (req, res) => {
 // 2. Batch Processing Endpoint
 app.post("/api/process-batch/:batchId", async (req, res) => {
   const { batchId } = req.params;
+  let batch;
+
   try {
     await ensureDbConnection();
-    const batch = await db
+    batch = await db
       .collection("batches")
       .findOne({ _id: new ObjectId(batchId) });
     if (!batch) return res.status(404).json({ error: "Batch not found" });
-    if (batch.status === "completed" || batch.status === "processing") {
-      return res
-        .status(400)
-        .json({ error: "Batch already processed or running" });
+    if (batch.status === "completed") {
+      return res.status(400).json({ error: "Batch already completed" });
     }
+
+    // Handle retry logic for failed batches
+    if (batch.status === "failed") {
+      const retryCount = batch.retryCount || 0;
+      if (retryCount >= 3) {
+        return res
+          .status(400)
+          .json({ error: "Batch has exceeded maximum retry attempts" });
+      }
+    }
+
     // Lock: ensure no other batch for this account is processing
     const processing = await db.collection("batches").findOne({
       operationId: batch.operationId,
       accountId: batch.accountId,
       status: "processing",
     });
-    if (processing)
+    if (processing && processing._id.toString() !== batchId) {
       return res
         .status(409)
         .json({ error: "Another batch is processing for this account" });
+    }
 
     // Mark this batch as processing
-    await db
-      .collection("batches")
-      .updateOne(
-        { _id: batch._id },
-        { $set: { status: "processing", startTime: new Date() } }
-      );
+    const retryCount = batch.retryCount || 0;
+    await db.collection("batches").updateOne(
+      { _id: batch._id },
+      {
+        $set: {
+          status: "processing",
+          startTime: new Date(),
+          retryCount: retryCount + 1,
+        },
+      }
+    );
     let completedJobs = [],
       failedJobs = [],
       errors = [];
     for (const uuid of batch.jobUUIDs) {
       try {
-        // Simulate job update (replace with real update logic)
-        // await updateJob(uuid);
-        completedJobs.push(uuid);
-        await new Promise((r) => setTimeout(r, 3000)); // 3s delay per job
+        // Get account details for API key
+        const account = await db
+          .collection("accounts")
+          .findOne({ _id: batch.accountId });
+        if (!account) {
+          throw new Error("Account not found");
+        }
+
+        // Fetch job details from Workiz API
+        const workizUrl = `https://api.workiz.com/api/v1/${account.workizApiKey}/job/get/${uuid}/`;
+        const response = await fetch(workizUrl);
+
+        if (!response.ok) {
+          throw new Error(
+            `Workiz API error: ${response.status} ${response.statusText}`
+          );
+        }
+
+        const jobData = await response.json();
+
+        if (jobData.flag && jobData.data) {
+          // Update job in database
+          await db.collection("jobs").updateOne(
+            { UUID: uuid, accountId: batch.accountId },
+            {
+              $set: {
+                ...jobData.data,
+                lastUpdated: new Date(),
+                accountId: batch.accountId,
+              },
+            },
+            { upsert: true }
+          );
+          completedJobs.push(uuid);
+        } else {
+          throw new Error("Invalid response from Workiz API");
+        }
+
+        // Rate limiting: 1 second delay between API calls
+        await new Promise((r) => setTimeout(r, 1000));
       } catch (e) {
         failedJobs.push(uuid);
         errors.push(`Job ${uuid}: ${e.message}`);
+        console.error(`Failed to update job ${uuid}:`, e);
       }
     }
-    // Mark batch as completed
+    // Determine batch status based on results
+    const batchStatus =
+      failedJobs.length === 0
+        ? "completed"
+        : failedJobs.length === batch.jobUUIDs.length
+        ? "failed"
+        : "completed_with_errors";
+
+    // Mark batch as completed/failed
     await db.collection("batches").updateOne(
       { _id: batch._id },
       {
         $set: {
-          status: "completed",
+          status: batchStatus,
           completedJobs,
           failedJobs,
           endTime: new Date(),
@@ -3309,6 +3371,67 @@ app.get("/api/batch-progress/:operationId", async (req, res) => {
       operationId,
       accounts,
       batches,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// 4. Retry Failed Batch Endpoint
+app.post("/api/retry-batch/:batchId", async (req, res) => {
+  const { batchId } = req.params;
+  try {
+    await ensureDbConnection();
+    const batch = await db
+      .collection("batches")
+      .findOne({ _id: new ObjectId(batchId) });
+
+    if (!batch) {
+      return res.status(404).json({ error: "Batch not found" });
+    }
+
+    if (batch.status === "completed") {
+      return res.status(400).json({ error: "Cannot retry completed batch" });
+    }
+
+    const retryCount = batch.retryCount || 0;
+    if (retryCount >= 3) {
+      return res
+        .status(400)
+        .json({ error: "Batch has exceeded maximum retry attempts" });
+    }
+
+    // Reset batch for retry
+    await db.collection("batches").updateOne(
+      { _id: batch._id },
+      {
+        $set: {
+          status: "pending",
+          completedJobs: [],
+          failedJobs: [],
+          errors: [],
+          startTime: null,
+          endTime: null,
+        },
+      }
+    );
+
+    // Trigger the batch processing
+    const baseUrl = `${req.protocol}://${req.get("host")}`;
+    setTimeout(async () => {
+      try {
+        await fetch(`${baseUrl}/api/process-batch/${batch._id}`, {
+          method: "POST",
+        });
+      } catch (error) {
+        console.error(`Failed to retry batch ${batch._id}:`, error);
+      }
+    }, 1000);
+
+    res.json({
+      message: "Batch queued for retry",
+      batchId,
+      retryCount: retryCount + 1,
     });
   } catch (err) {
     res.status(500).json({ error: err.message });
