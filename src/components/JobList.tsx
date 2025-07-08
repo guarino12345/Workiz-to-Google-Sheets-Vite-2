@@ -926,7 +926,7 @@ const JobList: React.FC<JobListProps> = ({ accounts }) => {
               startIcon={updatingJobs ? <Refresh /> : <Update />}
               sx={{ minWidth: '150px' }}
             >
-              {updatingJobs ? 'Updating...' : 'Update All Jobs (Parallel)'}
+              {updatingJobs ? 'Updating...' : 'Update All Jobs (Batch)'}
             </Button>
             <Button
               variant="contained"
@@ -954,8 +954,8 @@ const JobList: React.FC<JobListProps> = ({ accounts }) => {
           <Alert severity="info" sx={{ mb: 2 }}>
             <AlertTitle>Automated Sync</AlertTitle>
             Jobs are automatically synced daily at 9:00 AM UTC via Vercel Cron Jobs. 
-            Use the manual sync buttons above for immediate updates. The "Update All Jobs (Parallel)" 
-            button processes all accounts simultaneously for faster completion.
+            Use the manual sync buttons above for immediate updates. The "Update All Jobs (Batch)" 
+            button processes jobs in batches across all accounts for reliable completion.
           </Alert>
           {error && <Alert severity="error">{error}</Alert>}
         </>
