@@ -98,16 +98,14 @@ const JobList: React.FC<JobListProps> = ({ accounts }) => {
   const [syncingToSheets, setSyncingToSheets] = useState(false);
   const [updatingJobs, setUpdatingJobs] = useState(false);
   const [currentOperationId, setCurrentOperationId] = useState<string | null>(null);
-  const [operationProgress, setOperationProgress] = useState<any>(null);
+
   
   // New state for enhanced loading and progress
   const [syncProgress, setSyncProgress] = useState<SyncProgress | null>(null);
   const [syncResult, setSyncResult] = useState<SyncResult | null>(null);
   const [showSyncDetails, setShowSyncDetails] = useState(false);
   
-  // Resume functionality state
-  const [resumeInfo, setResumeInfo] = useState<any>(null);
-  const [resuming, setResuming] = useState(false);
+
 
   // Set initial selected account only once when component mounts
   useEffect(() => {
@@ -137,30 +135,7 @@ const JobList: React.FC<JobListProps> = ({ accounts }) => {
     fetchAllJobs();
   }, [accounts, syncing, updatingJobs]);
 
-  // Poll operation progress when operation is running
-  useEffect(() => {
-    if (!currentOperationId) return;
 
-    const pollInterval = setInterval(async () => {
-      try {
-        const response = await fetch(buildApiUrl(`/api/parallel-operation/${currentOperationId}`));
-        if (response.ok) {
-          const operation = await response.json();
-          setOperationProgress(operation);
-          
-          // Stop polling if operation is complete
-          if (operation.status === 'completed' || operation.status === 'completed_with_errors') {
-            setCurrentOperationId(null);
-            clearInterval(pollInterval);
-          }
-        }
-      } catch (error) {
-        console.error('Error polling operation status:', error);
-      }
-    }, 2000); // Poll every 2 seconds
-
-    return () => clearInterval(pollInterval);
-  }, [currentOperationId]);
 
   const handleAccountChange = (accountId: string) => {
     if (!accountId) {
@@ -451,87 +426,7 @@ const JobList: React.FC<JobListProps> = ({ accounts }) => {
     return poll();
   };
 
-  // Resume update for a specific account
-  const handleResumeUpdate = async (accountId: string, resumeFrom: string) => {
-    setResuming(true);
-    setError('');
-    setSyncResult(null);
-    setShowSyncDetails(false);
-    
-    // Initialize progress
-    updateSyncProgress('fetching', 0, 'Resuming job updates...');
-    
-    try {
-      console.log('Resuming job updates for account:', accountId, 'from job:', resumeFrom);
-      
-      updateSyncProgress('fetching', 25, 'Connecting to account...');
-      await new Promise<void>(resolve => setTimeout(resolve, 500));
-      
-      updateSyncProgress('processing', 50, 'Processing remaining jobs...');
-      await new Promise<void>(resolve => setTimeout(resolve, 500));
-      
-      const response = await fetch(
-        buildApiUrl(`/api/resume-account-update/${accountId}`),
-        {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json'
-          },
-          body: JSON.stringify({ resumeFrom })
-        }
-      );
-      
-      updateSyncProgress('updating', 75, 'Updating jobs in database...');
-      await new Promise<void>(resolve => setTimeout(resolve, 500));
-      
-      if (!response.ok) {
-        const errorData = await response.json() as { error?: string };
-        const errorMessage = errorData.error || 'Failed to resume job updates';
-        setError(errorMessage);
-        setSyncResult({
-          success: false,
-          message: 'Resume failed',
-          timestamp: new Date()
-        });
-        return;
-      }
-      
-      const result = await response.json();
-      
-      updateSyncProgress('complete', 100, 'Resume completed successfully!');
-      await new Promise<void>(resolve => setTimeout(resolve, 500));
-      
-      setSyncResult({
-        success: true,
-        message: `Successfully resumed and completed job updates`,
-        details: {
-          jobsUpdated: result.jobsUpdated || 0,
-          jobsDeleted: result.jobsDeleted || 0,
-          failedUpdates: result.failedUpdates || 0,
-          resumeInfo: result.resumeInfo
-        },
-        timestamp: new Date()
-      });
-      
-      // Clear resume info if all jobs are processed
-      if (result.resumeInfo && !result.resumeInfo.canResume) {
-        setResumeInfo(null);
-      }
-      
-      console.log('Resume successful:', result);
-    } catch (err) {
-      console.error('Resume error:', err);
-      setError(getErrorMessage(err));
-      setSyncResult({
-        success: false,
-        message: 'Resume failed',
-        timestamp: new Date()
-      });
-    } finally {
-      setResuming(false);
-      setSyncProgress(null);
-    }
-  };
+
 
   // Sync to Google Sheets
   const handleSyncToSheets = async () => {
@@ -739,55 +634,7 @@ const JobList: React.FC<JobListProps> = ({ accounts }) => {
             </Card>
           )}
 
-          {/* Real-time Operation Progress */}
-          {operationProgress && (
-            <Card sx={{ mb: 2, border: '1px solid', borderColor: 'primary.main' }}>
-              <CardContent>
-                <Typography variant="h6" gutterBottom>
-                  Parallel Operation Progress
-                </Typography>
-                <Box sx={{ mb: 2 }}>
-                  <Typography variant="body2" color="text.secondary">
-                    Status: {operationProgress.status}
-                  </Typography>
-                  <Typography variant="body2" color="text.secondary">
-                    Accounts: {operationProgress.completedAccounts}/{operationProgress.totalAccounts} completed
-                  </Typography>
-                  {operationProgress.duration && (
-                    <Typography variant="body2" color="text.secondary">
-                      Duration: {Math.round(operationProgress.duration / 1000)}s
-                    </Typography>
-                  )}
-                </Box>
-                
-                {/* Account-specific progress */}
-                {operationProgress.accounts && (
-                  <Box sx={{ mt: 2 }}>
-                    <Typography variant="subtitle2" gutterBottom>
-                      Account Progress:
-                    </Typography>
-                    {operationProgress.accounts.map((account: any, index: number) => (
-                      <Box key={index} sx={{ mb: 1, p: 1, border: '1px solid #e0e0e0', borderRadius: 1 }}>
-                        <Typography variant="body2" sx={{ fontWeight: 'bold' }}>
-                          {account.accountName}
-                        </Typography>
-                        <Typography variant="body2" color="text.secondary">
-                          Status: {account.status} | 
-                          Updated: {account.jobsUpdated} | 
-                          Deleted: {account.jobsDeleted}
-                        </Typography>
-                        {account.errors && account.errors.length > 0 && (
-                          <Typography variant="body2" color="error" sx={{ fontSize: '0.75rem' }}>
-                            Errors: {account.errors.length}
-                          </Typography>
-                        )}
-                      </Box>
-                    ))}
-                  </Box>
-                )}
-              </CardContent>
-            </Card>
-          )}
+
 
           {/* Sync Result */}
           {syncResult && (
@@ -866,45 +713,7 @@ const JobList: React.FC<JobListProps> = ({ accounts }) => {
             </Card>
           )}
 
-          {/* Resume Options */}
-          {resumeInfo && resumeInfo.length > 0 && (
-            <Card sx={{ mb: 2, border: '1px solid', borderColor: 'warning.main', backgroundColor: 'warning.50' }}>
-              <CardContent>
-                <Typography variant="h6" gutterBottom color="warning.main">
-                  Resume Available
-                </Typography>
-                <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
-                  Some accounts have remaining jobs that can be processed. Click "Resume" to continue from where they left off.
-                </Typography>
-                <Box sx={{ display: 'flex', flexDirection: 'column', gap: 1 }}>
-                  {resumeInfo.map((account: any, index: number) => (
-                    <Box key={index} sx={{ p: 2, border: '1px solid #e0e0e0', borderRadius: 1, backgroundColor: 'white' }}>
-                      <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                        <Box>
-                          <Typography variant="subtitle1" sx={{ fontWeight: 'bold' }}>
-                            {account.account}
-                          </Typography>
-                          <Typography variant="body2" color="text.secondary">
-                            {account.resumeInfo.remainingJobs} jobs remaining | 
-                            Last processed: {account.resumeInfo.lastProcessedJob}
-                          </Typography>
-                        </Box>
-                        <Button
-                          variant="outlined"
-                          color="warning"
-                          onClick={() => handleResumeUpdate(account.accountId || account.account, account.resumeInfo.lastProcessedJob)}
-                          disabled={resuming}
-                          size="small"
-                        >
-                          {resuming ? 'Resuming...' : 'Resume'}
-                        </Button>
-                      </Box>
-                    </Box>
-                  ))}
-                </Box>
-              </CardContent>
-            </Card>
-          )}
+
 
           {/* Three Main Action Buttons */}
           <Box sx={{ display: 'flex', gap: 2, mb: 2, flexWrap: 'wrap' }}>
@@ -912,7 +721,7 @@ const JobList: React.FC<JobListProps> = ({ accounts }) => {
               variant="contained"
               color="primary"
               onClick={handleSyncLatestJobs}
-              disabled={syncing || updatingJobs || syncingToSheets || resuming}
+              disabled={syncing || updatingJobs || syncingToSheets}
               startIcon={syncing ? <Refresh /> : <CloudDownload />}
               sx={{ minWidth: '150px' }}
             >
@@ -922,7 +731,7 @@ const JobList: React.FC<JobListProps> = ({ accounts }) => {
               variant="contained"
               color="secondary"
               onClick={handleUpdateAllJobs}
-              disabled={syncing || updatingJobs || syncingToSheets || resuming}
+              disabled={syncing || updatingJobs || syncingToSheets}
               startIcon={updatingJobs ? <Refresh /> : <Update />}
               sx={{ minWidth: '150px' }}
             >
@@ -932,7 +741,7 @@ const JobList: React.FC<JobListProps> = ({ accounts }) => {
               variant="contained"
               color="success"
               onClick={handleSyncToSheets}
-              disabled={syncing || updatingJobs || syncingToSheets || resuming || !selectedAccount.googleSheetsId}
+              disabled={syncing || updatingJobs || syncingToSheets || !selectedAccount.googleSheetsId}
               startIcon={syncingToSheets ? <Refresh /> : <CloudUpload />}
               sx={{ minWidth: '150px' }}
             >
