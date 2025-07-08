@@ -19,7 +19,7 @@ import {
 } from '@mui/material';
 import { 
   CheckCircle, 
-  Error, 
+  Error as ErrorIcon, 
   ExpandMore, 
   ExpandLess,
   CloudDownload,
@@ -65,6 +65,7 @@ interface SyncResult {
     failedUpdates?: number;
     successfulAccounts?: number;
     totalAccounts?: number;
+    failedAccounts?: number;
     operationId?: string;
     resumeInfo?: any;
   };
@@ -258,35 +259,26 @@ const JobList: React.FC<JobListProps> = ({ accounts }) => {
     }
   };
 
-  // Update All Jobs - updates existing jobs by UUID using parallel processing
+  // Update All Jobs - updates existing jobs by UUID using fire-and-forget parallel processing
   const handleUpdateAllJobs = async () => {
-    if (!selectedAccount?.id) {
-      console.error('No account ID available for update');
-      return;
-    }
-    
     setUpdatingJobs(true);
     setError('');
     setSyncResult(null);
     setShowSyncDetails(false);
     
     // Initialize progress
-    updateSyncProgress('fetching', 0, 'Initializing parallel job updates...');
+    updateSyncProgress('fetching', 0, 'Initializing fire-and-forget parallel job updates...');
     
     try {
-      console.log('Starting parallel job updates for all accounts');
+      console.log('Starting fire-and-forget parallel job updates for all accounts');
       
-      // Simulate progress updates for better UX
       updateSyncProgress('fetching', 10, 'Preparing parallel processing...');
       await new Promise<void>(resolve => setTimeout(resolve, 500));
       
-      updateSyncProgress('fetching', 25, 'Starting parallel workers...');
+      updateSyncProgress('fetching', 25, 'Triggering parallel workers...');
       await new Promise<void>(resolve => setTimeout(resolve, 500));
       
-      updateSyncProgress('processing', 40, 'Processing jobs in parallel...');
-      await new Promise<void>(resolve => setTimeout(resolve, 500));
-      
-      // Call the parallel processing endpoint
+      // Call the fire-and-forget parallel processing endpoint
       const response = await fetch(
         buildApiUrl(`/api/update-all-jobs-parallel`),
         { 
@@ -297,59 +289,38 @@ const JobList: React.FC<JobListProps> = ({ accounts }) => {
         }
       );
       
-      updateSyncProgress('updating', 70, 'Updating jobs in database...');
-      await new Promise<void>(resolve => setTimeout(resolve, 500));
-      
       if (!response.ok) {
         const errorData = await response.json() as { error?: string };
-        const errorMessage = errorData.error || 'Failed to update jobs';
+        const errorMessage = errorData.error || 'Failed to initiate job updates';
         setError(errorMessage);
         setSyncResult({
           success: false,
-          message: 'Update failed',
+          message: 'Update initiation failed',
           timestamp: new Date()
         });
         return;
       }
       
-      const result = await response.json() as { operationId?: string; details?: any; results?: any[] };
+      const result = await response.json() as { 
+        operationId?: string; 
+        message?: string;
+        totalAccounts?: number;
+        triggeredAccounts?: number;
+        status?: string;
+      };
       
-      // Set operation ID for real-time progress tracking
+      console.log('Fire-and-forget initiated:', result);
+      
       if (result.operationId) {
         setCurrentOperationId(result.operationId);
+        updateSyncProgress('processing', 40, 'Workers are running independently. Monitoring progress...');
+        
+        // Start polling for progress
+        await pollProgress(result.operationId);
+      } else {
+        throw new Error('No operation ID received from server');
       }
       
-      updateSyncProgress('complete', 100, 'Parallel job updates completed successfully!');
-      await new Promise<void>(resolve => setTimeout(resolve, 500));
-      
-      // Calculate summary from results
-      const totalJobsUpdated = result.results?.reduce((sum, r) => sum + (r.jobsUpdated || 0), 0) || 0;
-      const totalJobsDeleted = result.results?.reduce((sum, r) => sum + (r.jobsDeleted || 0), 0) || 0;
-      const totalFailed = result.results?.reduce((sum, r) => sum + (r.failedUpdates || 0), 0) || 0;
-      const successfulAccounts = result.results?.filter(r => r.success).length || 0;
-      const totalAccounts = result.results?.length || 0;
-      
-      // Check for accounts that can be resumed
-      const accountsWithResume = result.results?.filter(r => r.resumeInfo?.canResume) || [];
-      if (accountsWithResume.length > 0) {
-        setResumeInfo(accountsWithResume);
-      }
-      
-      setSyncResult({
-        success: true,
-        message: `Successfully updated jobs across ${successfulAccounts}/${totalAccounts} accounts`,
-        details: {
-          jobsUpdated: totalJobsUpdated,
-          jobsDeleted: totalJobsDeleted,
-          failedUpdates: totalFailed,
-          successfulAccounts,
-          totalAccounts,
-          operationId: result.operationId
-        },
-        timestamp: new Date()
-      });
-      
-      console.log('Parallel update successful:', result);
     } catch (err) {
       console.error('Update error:', err);
       setError(getErrorMessage(err));
@@ -362,6 +333,109 @@ const JobList: React.FC<JobListProps> = ({ accounts }) => {
       setUpdatingJobs(false);
       setSyncProgress(null);
     }
+  };
+
+  // Poll progress for fire-and-forget operations
+  const pollProgress = async (operationId: string) => {
+    const maxAttempts = 60; // 5 minutes with 5-second intervals
+    let attempts = 0;
+    
+    const poll = async (): Promise<void> => {
+      try {
+        const response = await fetch(buildApiUrl(`/api/parallel-progress/${operationId}`));
+        
+        if (!response.ok) {
+          throw new Error('Failed to fetch progress');
+        }
+        
+        const progress = await response.json() as {
+          status: string;
+          progress: {
+            totalAccounts: number;
+            completedAccounts: number;
+            failedAccounts: number;
+            runningAccounts: number;
+            completionPercentage: number;
+          };
+          jobs: {
+            totalProcessed: number;
+            totalUpdated: number;
+            totalDeleted: number;
+          };
+          accounts: Array<{
+            accountName: string;
+            status: string;
+            jobsProcessed: number;
+            jobsUpdated: number;
+            jobsDeleted: number;
+            canResume: boolean;
+            resumePoint?: string;
+          }>;
+        };
+        
+        // Update progress display
+        const percentage = progress.progress.completionPercentage;
+        const phase = progress.status === 'completed' || progress.status === 'completed_with_errors' 
+          ? 'complete' 
+          : 'processing';
+        
+        updateSyncProgress(
+          phase, 
+          percentage, 
+          `Processing: ${progress.progress.completedAccounts}/${progress.progress.totalAccounts} accounts completed`,
+          `Jobs: ${progress.jobs.totalUpdated} updated, ${progress.jobs.totalDeleted} deleted`
+        );
+        
+        // Check if operation is complete
+        if (progress.status === 'completed' || progress.status === 'completed_with_errors') {
+          // Check for accounts that can be resumed
+          const accountsWithResume = progress.accounts.filter(acc => acc.canResume);
+          if (accountsWithResume.length > 0) {
+            setResumeInfo(accountsWithResume.map(acc => ({
+              accountId: acc.accountName,
+              resumeFrom: acc.resumePoint,
+              jobsProcessed: acc.jobsProcessed,
+              jobsUpdated: acc.jobsUpdated,
+              jobsDeleted: acc.jobsDeleted
+            })));
+          }
+          
+          setSyncResult({
+            success: progress.status === 'completed',
+            message: progress.status === 'completed' 
+              ? `Successfully updated jobs across all ${progress.progress.totalAccounts} accounts`
+              : `Completed with errors: ${progress.progress.failedAccounts} accounts failed`,
+            details: {
+              jobsUpdated: progress.jobs.totalUpdated,
+              jobsDeleted: progress.jobs.totalDeleted,
+              successfulAccounts: progress.progress.completedAccounts,
+              totalAccounts: progress.progress.totalAccounts,
+              failedAccounts: progress.progress.failedAccounts,
+              operationId: operationId
+            },
+            timestamp: new Date()
+          });
+          
+          return; // Stop polling
+        }
+        
+        // Continue polling if not complete
+        attempts++;
+        if (attempts >= maxAttempts) {
+          throw new Error('Progress polling timeout - operation may still be running');
+        }
+        
+        // Wait 5 seconds before next poll
+        await new Promise(resolve => setTimeout(resolve, 5000));
+        return poll();
+        
+      } catch (error) {
+        console.error('Progress polling error:', error);
+        throw error;
+      }
+    };
+    
+    return poll();
   };
 
   // Resume update for a specific account
@@ -712,7 +786,7 @@ const JobList: React.FC<JobListProps> = ({ accounts }) => {
             }}>
               <CardContent>
                 <Box sx={{ display: 'flex', alignItems: 'center', mb: 1 }}>
-                  {syncResult.success ? <CheckCircle color="success" /> : <Error color="error" />}
+                  {syncResult.success ? <CheckCircle color="success" /> : <ErrorIcon color="error" />}
                   <Typography variant="h6" sx={{ ml: 1, flexGrow: 1 }}>
                     {syncResult.message}
                   </Typography>

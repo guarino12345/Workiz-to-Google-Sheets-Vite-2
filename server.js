@@ -3092,13 +3092,13 @@ app.get("/api/cron/update-jobs-uuid", async (req, res) => {
   }
 });
 
-// Master function for parallel account processing
+// Master function for parallel account processing (Fire-and-Forget)
 app.post("/api/update-all-jobs-parallel", async (req, res) => {
   const startTime = Date.now();
 
   try {
     console.log(
-      `🚀 Starting parallel job update for all accounts at ${new Date().toISOString()}`
+      `🚀 Starting fire-and-forget parallel job update for all accounts at ${new Date().toISOString()}`
     );
 
     await ensureDbConnection();
@@ -3133,15 +3133,19 @@ app.post("/api/update-all-jobs-parallel", async (req, res) => {
         jobsUpdated: 0,
         jobsDeleted: 0,
         errors: [],
+        lastProcessedJob: null,
+        resumePoint: null,
       })),
     };
 
     await db.collection("parallelOperations").insertOne(operationRecord);
 
-    // Start parallel processing for each account
-    const accountPromises = accounts.map(async (account) => {
+    // Fire-and-forget: Trigger all workers without waiting
+    console.log(`🔥 Triggering ${accounts.length} worker functions...`);
+
+    const workerPromises = accounts.map(async (account) => {
       try {
-        console.log(`🔄 Starting parallel update for account: ${account.name}`);
+        console.log(`🔄 Triggering worker for account: ${account.name}`);
 
         // Update account status to running
         await db
@@ -3151,202 +3155,64 @@ app.post("/api/update-all-jobs-parallel", async (req, res) => {
             { $set: { "accounts.$.status": "running" } }
           );
 
-        // Call the account-specific worker function with extended timeout and retry
-        const workerResponse = await RetryHandler.withRetry(
-          async () => {
-            return await APIManager.fetchWithTimeout(
-              `${req.protocol}://${req.get("host")}/api/update-account-jobs/${
-                account._id
-              }`,
-              {
-                method: "POST",
-                headers: {
-                  "Content-Type": "application/json",
-                  "X-Operation-ID": operationId,
-                },
-              },
-              12 * 60 * 1000 // 12 minutes timeout for worker functions
-            );
-          },
-          2, // 2 retries
-          5000, // 5 second delay between retries
-          null // No circuit breaker for internal calls
-        );
-
-        const workerResult = await workerResponse.json();
-
-        // Update account status based on result
-        const status = workerResponse.ok ? "completed" : "failed";
-        await db.collection("parallelOperations").updateOne(
-          { operationId, "accounts.accountId": account._id },
+        // Fire the worker function without waiting for response
+        fetch(
+          `${req.protocol}://${req.get("host")}/api/update-account-jobs/${
+            account._id
+          }`,
           {
-            $set: {
-              "accounts.$.status": status,
-              "accounts.$.jobsProcessed": workerResult.jobsProcessed || 0,
-              "accounts.$.jobsUpdated": workerResult.jobsUpdated || 0,
-              "accounts.$.jobsDeleted": workerResult.jobsDeleted || 0,
-              "accounts.$.errors": workerResult.errors || [],
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "X-Operation-ID": operationId,
+              "User-Agent": "Workiz-Sync-System/1.0",
             },
+            body: JSON.stringify({
+              operationId: operationId,
+              fireAndForget: true,
+            }),
           }
-        );
+        ).catch((error) => {
+          console.log(
+            `⚠️ Worker trigger failed for ${account.name}:`,
+            error.message
+          );
+          // Don't throw - this is expected in fire-and-forget
+        });
 
-        // Update overall completion count
-        const updateField = workerResponse.ok
-          ? "completedAccounts"
-          : "failedAccounts";
-        await db
-          .collection("parallelOperations")
-          .updateOne({ operationId }, { $inc: { [updateField]: 1 } });
-
-        console.log(
-          `✅ Account ${account.name} ${status}: ${
-            workerResult.jobsUpdated || 0
-          } updated, ${workerResult.jobsDeleted || 0} deleted, ${
-            workerResult.failedUpdates || 0
-          } failed`
-        );
-
-        return {
-          account: account.name,
-          success: workerResponse.ok,
-          ...workerResult,
-        };
+        console.log(`✅ Worker triggered for account: ${account.name}`);
+        return { account: account.name, triggered: true };
       } catch (error) {
-        console.error(`❌ Error processing account ${account.name}:`, error);
-
-        // Check if it's a timeout error
-        const isTimeoutError =
-          error.message.includes("timeout") ||
-          error.message.includes("HeadersTimeoutError") ||
-          error.cause?.code === "UND_ERR_HEADERS_TIMEOUT";
-
-        // If it's a timeout, check if the worker actually completed by looking at the database
-        if (isTimeoutError) {
-          try {
-            // Check if the worker completed by looking for sync history
-            const syncHistory = await db.collection("syncHistory").findOne({
-              accountId: account._id,
-              syncType: "jobs_uuid_update",
-              "details.operationId": operationId,
-              timestamp: { $gte: new Date(Date.now() - 5 * 60 * 1000) }, // Last 5 minutes
-            });
-
-            if (syncHistory) {
-              console.log(
-                `✅ Account ${account.name} actually completed despite timeout`
-              );
-
-              // Update account status to completed
-              await db.collection("parallelOperations").updateOne(
-                { operationId, "accounts.accountId": account._id },
-                {
-                  $set: {
-                    "accounts.$.status": "completed",
-                    "accounts.$.jobsProcessed":
-                      syncHistory.details.totalJobs || 0,
-                    "accounts.$.jobsUpdated":
-                      syncHistory.details.jobsUpdated || 0,
-                    "accounts.$.jobsDeleted":
-                      syncHistory.details.jobsDeleted || 0,
-                    "accounts.$.errors": [],
-                  },
-                }
-              );
-
-              // Update completed count
-              await db
-                .collection("parallelOperations")
-                .updateOne({ operationId }, { $inc: { completedAccounts: 1 } });
-
-              return {
-                account: account.name,
-                success: true,
-                jobsProcessed: syncHistory.details.totalJobs || 0,
-                jobsUpdated: syncHistory.details.jobsUpdated || 0,
-                jobsDeleted: syncHistory.details.jobsDeleted || 0,
-                failedUpdates: syncHistory.details.failedUpdates || 0,
-                duration: syncHistory.duration || 0,
-              };
-            }
-          } catch (dbError) {
-            console.log(
-              `⚠️ Could not verify completion for ${account.name}:`,
-              dbError.message
-            );
-          }
-        }
-
-        // Update account status to failed
-        await db.collection("parallelOperations").updateOne(
-          { operationId, "accounts.accountId": account._id },
-          {
-            $set: {
-              "accounts.$.status": "failed",
-              "accounts.$.errors": [error.message],
-            },
-          }
-        );
-
-        // Update failed count
-        await db
-          .collection("parallelOperations")
-          .updateOne({ operationId }, { $inc: { failedAccounts: 1 } });
-
+        console.error(`❌ Error triggering worker for ${account.name}:`, error);
         return {
           account: account.name,
-          success: false,
+          triggered: false,
           error: error.message,
         };
       }
     });
 
-    // Wait for all accounts to complete (with timeout)
-    const timeoutPromise = new Promise((_, reject) => {
-      setTimeout(
-        () => reject(new Error("Parallel processing timeout")),
-        13 * 60 * 1000
-      ); // 13 minutes to give workers more time
-    });
-
-    const results = await Promise.race([
-      Promise.all(accountPromises),
-      timeoutPromise,
-    ]);
-
-    // Update final operation status
-    const finalStatus = results.every((r) => r.success)
-      ? "completed"
-      : "completed_with_errors";
-    await db.collection("parallelOperations").updateOne(
-      { operationId },
-      {
-        $set: {
-          status: finalStatus,
-          endTime: new Date(),
-          duration: Date.now() - startTime,
-        },
-      }
-    );
-
-    const totalDuration = Date.now() - startTime;
-    const successfulUpdates = results.filter((r) => r.success).length;
-    const failedUpdates = results.filter((r) => !r.success).length;
+    // Wait only for the trigger phase to complete (not the actual work)
+    const triggerResults = await Promise.all(workerPromises);
+    const triggeredCount = triggerResults.filter((r) => r.triggered).length;
 
     console.log(
-      `📊 Parallel update completed: ${successfulUpdates} successful, ${failedUpdates} failed`
+      `✅ Successfully triggered ${triggeredCount}/${accounts.length} workers`
     );
 
     res.json({
       operationId,
-      message: `Parallel update completed: ${successfulUpdates} successful, ${failedUpdates} failed`,
-      duration: totalDuration,
-      results: results,
+      message: `Fire-and-forget update initiated: ${triggeredCount} workers triggered`,
+      totalAccounts: accounts.length,
+      triggeredAccounts: triggeredCount,
+      status: "initiated",
       timestamp: new Date().toISOString(),
+      note: "Workers are running independently. Use /api/parallel-progress/{operationId} to check progress.",
     });
   } catch (error) {
     const duration = Date.now() - startTime;
     console.log(
-      `❌ Parallel update error after ${duration}ms: ${error.message}`
+      `❌ Fire-and-forget initiation error after ${duration}ms: ${error.message}`
     );
     console.error("Full error:", error);
 
@@ -3358,14 +3224,17 @@ app.post("/api/update-all-jobs-parallel", async (req, res) => {
   }
 });
 
-// Worker function for individual account processing
+// Worker function for individual account processing (Fire-and-Forget)
 app.post("/api/update-account-jobs/:accountId", async (req, res) => {
   const accountStartTime = Date.now();
   const { accountId } = req.params;
   const operationId = req.get("X-Operation-ID");
+  const isFireAndForget = req.body && req.body.fireAndForget;
 
   try {
-    console.log(`🔄 Starting account worker for account ID: ${accountId}`);
+    console.log(
+      `🔄 Starting account worker for account ID: ${accountId} (fire-and-forget: ${isFireAndForget})`
+    );
 
     await ensureDbConnection();
 
@@ -3421,6 +3290,30 @@ app.post("/api/update-account-jobs/:accountId", async (req, res) => {
 
     if (jobsToProcess.length === 0) {
       console.log(`⚠️ No jobs to process for account: ${account.name}`);
+
+      // Update operation status in database
+      if (operationId) {
+        await db.collection("parallelOperations").updateOne(
+          { operationId, "accounts.accountId": account._id },
+          {
+            $set: {
+              "accounts.$.status": "completed",
+              "accounts.$.jobsProcessed": 0,
+              "accounts.$.jobsUpdated": 0,
+              "accounts.$.jobsDeleted": 0,
+            },
+          }
+        );
+        await db
+          .collection("parallelOperations")
+          .updateOne({ operationId }, { $inc: { completedAccounts: 1 } });
+      }
+
+      // For fire-and-forget, don't send response
+      if (isFireAndForget) {
+        return res.status(200).end();
+      }
+
       return res.json({
         account: account.name,
         success: true,
@@ -3613,6 +3506,41 @@ app.post("/api/update-account-jobs/:accountId", async (req, res) => {
       jobsToProcess[Math.min(currentIndex, jobsToProcess.length - 1)]?.UUID ||
       null;
 
+    // Update operation status in database for fire-and-forget
+    if (operationId) {
+      const isCompleted = remainingJobs === 0;
+      const status = isCompleted ? "completed" : "timeout_with_resume";
+
+      await db.collection("parallelOperations").updateOne(
+        { operationId, "accounts.accountId": account._id },
+        {
+          $set: {
+            "accounts.$.status": status,
+            "accounts.$.jobsProcessed": jobsToProcess.length,
+            "accounts.$.jobsUpdated": updatedJobsCount,
+            "accounts.$.jobsDeleted": deletedJobsCount,
+            "accounts.$.errors": errors,
+            "accounts.$.lastProcessedJob": lastProcessedJob,
+            "accounts.$.resumePoint": isCompleted ? null : lastProcessedJob,
+          },
+        }
+      );
+
+      if (isCompleted) {
+        await db
+          .collection("parallelOperations")
+          .updateOne({ operationId }, { $inc: { completedAccounts: 1 } });
+      }
+    }
+
+    // For fire-and-forget, don't send response
+    if (isFireAndForget) {
+      console.log(
+        `📤 Fire-and-forget worker completed for ${account.name}, ending response`
+      );
+      return res.status(200).end();
+    }
+
     const response = {
       account: account.name,
       success: true,
@@ -3641,6 +3569,30 @@ app.post("/api/update-account-jobs/:accountId", async (req, res) => {
     );
     console.error("Full error:", error);
 
+    // Update operation status in database for fire-and-forget
+    if (operationId) {
+      await db.collection("parallelOperations").updateOne(
+        { operationId, "accounts.accountId": account._id },
+        {
+          $set: {
+            "accounts.$.status": "failed",
+            "accounts.$.errors": [error.message],
+          },
+        }
+      );
+      await db
+        .collection("parallelOperations")
+        .updateOne({ operationId }, { $inc: { failedAccounts: 1 } });
+    }
+
+    // For fire-and-forget, don't send response
+    if (isFireAndForget) {
+      console.log(
+        `📤 Fire-and-forget worker failed for ${accountId}, ending response`
+      );
+      return res.status(500).end();
+    }
+
     const errorResponse = {
       account: accountId,
       success: false,
@@ -3650,6 +3602,100 @@ app.post("/api/update-account-jobs/:accountId", async (req, res) => {
 
     console.log(`📤 Sending error response for ${accountId}:`, errorResponse);
     res.status(500).json(errorResponse);
+  }
+});
+
+// Progress endpoint for parallel operations
+app.get("/api/parallel-progress/:operationId", async (req, res) => {
+  const { operationId } = req.params;
+
+  try {
+    await ensureDbConnection();
+
+    const operation = await db.collection("parallelOperations").findOne({
+      operationId: operationId,
+    });
+
+    if (!operation) {
+      return res.status(404).json({
+        error: "Operation not found",
+        operationId: operationId,
+      });
+    }
+
+    // Calculate overall progress
+    const totalAccounts = operation.totalAccounts;
+    const completedAccounts = operation.completedAccounts || 0;
+    const failedAccounts = operation.failedAccounts || 0;
+    const runningAccounts = totalAccounts - completedAccounts - failedAccounts;
+
+    // Calculate total jobs processed across all accounts
+    const totalJobsProcessed = operation.accounts.reduce(
+      (sum, account) => sum + (account.jobsProcessed || 0),
+      0
+    );
+    const totalJobsUpdated = operation.accounts.reduce(
+      (sum, account) => sum + (account.jobsUpdated || 0),
+      0
+    );
+    const totalJobsDeleted = operation.accounts.reduce(
+      (sum, account) => sum + (account.jobsDeleted || 0),
+      0
+    );
+
+    // Determine overall status
+    let overallStatus = operation.status;
+    if (operation.status === "running") {
+      if (completedAccounts + failedAccounts === totalAccounts) {
+        overallStatus =
+          failedAccounts === 0 ? "completed" : "completed_with_errors";
+      }
+    }
+
+    const response = {
+      operationId: operationId,
+      status: overallStatus,
+      startTime: operation.startTime,
+      endTime: operation.endTime,
+      duration: operation.endTime
+        ? new Date(operation.endTime) - new Date(operation.startTime)
+        : Date.now() - new Date(operation.startTime),
+      progress: {
+        totalAccounts: totalAccounts,
+        completedAccounts: completedAccounts,
+        failedAccounts: failedAccounts,
+        runningAccounts: runningAccounts,
+        completionPercentage: Math.round(
+          ((completedAccounts + failedAccounts) / totalAccounts) * 100
+        ),
+      },
+      jobs: {
+        totalProcessed: totalJobsProcessed,
+        totalUpdated: totalJobsUpdated,
+        totalDeleted: totalJobsDeleted,
+      },
+      accounts: operation.accounts.map((account) => ({
+        accountId: account.accountId,
+        accountName: account.accountName,
+        status: account.status,
+        jobsProcessed: account.jobsProcessed || 0,
+        jobsUpdated: account.jobsUpdated || 0,
+        jobsDeleted: account.jobsDeleted || 0,
+        errors: account.errors || [],
+        lastProcessedJob: account.lastProcessedJob,
+        resumePoint: account.resumePoint,
+        canResume:
+          account.status === "timeout_with_resume" && account.resumePoint,
+      })),
+    };
+
+    res.json(response);
+  } catch (error) {
+    console.error("Error fetching parallel progress:", error);
+    res.status(500).json({
+      error: error.message,
+      operationId: operationId,
+    });
   }
 });
 
