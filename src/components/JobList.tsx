@@ -420,9 +420,9 @@ const JobList: React.FC<JobListProps> = ({ accounts }) => {
       } catch (error) {
         console.error('Batch progress polling error:', error);
         throw error;
-      }
-    };
-    
+    }
+  };
+
     return poll();
   };
 

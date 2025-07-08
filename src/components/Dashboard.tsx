@@ -3,6 +3,7 @@ import { Box, Paper, Typography, Tabs, Tab } from '@mui/material';
 import AccountForm from './AccountForm';
 import AccountList from './AccountList';
 import JobList from './JobList';
+import { BatchManager } from './BatchManager';
 import { Account } from '../types/index';
 import { buildApiUrl } from '../utils/api';
 
@@ -58,6 +59,7 @@ const Dashboard: React.FC = () => {
       
       <Tabs value={activeTab} onChange={handleTabChange} sx={{ mb: 3 }}>
         <Tab label="Account Management" />
+        <Tab label="Batch Processing" />
       </Tabs>
 
       {activeTab === 0 && (
@@ -99,6 +101,12 @@ const Dashboard: React.FC = () => {
               <JobList accounts={accounts} />
             </Paper>
           </Box>
+        </Box>
+      )}
+      
+      {activeTab === 1 && (
+        <Box sx={{ display: 'flex', flexDirection: 'column', gap: 3 }}>
+          <BatchManager />
         </Box>
       )}
     </Box>
